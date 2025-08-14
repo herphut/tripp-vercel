@@ -27,9 +27,7 @@ form.addEventListener('submit', async (e) => {
   const content = input.value.trim();
   if (!content) return;
 
-  // cancel any in-flight stream
-  if (controller) controller.abort();
-
+  if (controller) controller.abort();          // cancel old stream if any
   const btn = form.querySelector('button');
   btn.disabled = true; input.disabled = true;
   out.textContent = ''; input.value = '';
@@ -38,30 +36,36 @@ form.addEventListener('submit', async (e) => {
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ messages: [{ role:'user', content }] }),
       signal: controller.signal
     });
-    if (!res.ok || !res.body) {
-      out.textContent = `Error: ${res.status} ${res.statusText||''}`.trim();
+    if (!res.ok) {
+      out.textContent = `Error: ${res.status}`;
       return;
     }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      out.textContent += dec.decode(value, { stream:true });
+    // Support both streaming and non-streaming
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('event-stream')) {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        out.textContent += dec.decode(value, { stream:true });
+      }
+    } else {
+      const txt = await res.text();
+      out.textContent = txt;
     }
   } catch (err) {
-    if (err.name !== 'AbortError') {
-      out.textContent = 'Error contacting Tripp (rate limited or aborted).';
-    }
+    if (err.name !== 'AbortError') out.textContent = 'Error contacting Tripp (rate limited or aborted).';
   } finally {
     btn.disabled = false; input.disabled = false; controller = null;
   }
 });
 </script>
+
 
 </body>
 </html>
