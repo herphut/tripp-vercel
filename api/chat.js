@@ -46,7 +46,7 @@ export default async function handler(req) {
   const payload = {
     model: 'gpt-4o-mini',
     messages,
-    stream: true
+    stream: false
   };
 
   const base = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
