@@ -16,7 +16,7 @@
     <pre id="out"></pre>
   </main>
 
- <script>
+<script>
 const form = document.querySelector('#chat');
 const input = document.querySelector('#input');
 const out   = document.querySelector('#out');
@@ -40,11 +40,13 @@ form.addEventListener('submit', async (e) => {
       body: JSON.stringify({ messages: [{ role:'user', content }] }),
       signal: controller.signal
     });
+
     if (!res.ok) {
-      out.textContent = `Error: ${res.status}`;
+      const txt = await res.text().catch(()=> '');
+      out.textContent = `Error ${res.status}\n${txt || '(no body)'}`;
       return;
     }
-    // Support both streaming and non-streaming
+
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('event-stream')) {
       const reader = res.body.getReader();
@@ -59,7 +61,9 @@ form.addEventListener('submit', async (e) => {
       out.textContent = txt;
     }
   } catch (err) {
-    if (err.name !== 'AbortError') out.textContent = 'Error contacting Tripp (rate limited or aborted).';
+    if (err.name !== 'AbortError') {
+      out.textContent = 'Error contacting Tripp (rate limited or aborted).';
+    }
   } finally {
     btn.disabled = false; input.disabled = false; controller = null;
   }
