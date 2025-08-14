@@ -16,39 +16,52 @@
     <pre id="out"></pre>
   </main>
 
-  <script>
-  const form = document.querySelector('#chat');
-  const input = document.querySelector('#input');
-  const out   = document.querySelector('#out');
+ <script>
+const form = document.querySelector('#chat');
+const input = document.querySelector('#input');
+const out   = document.querySelector('#out');
+let controller = null;
 
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const content = input.value.trim();
-    if (!content) return;
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const content = input.value.trim();
+  if (!content) return;
 
-    out.textContent = '';
-    input.value = '';
+  // cancel any in-flight stream
+  if (controller) controller.abort();
 
+  const btn = form.querySelector('button');
+  btn.disabled = true; input.disabled = true;
+  out.textContent = ''; input.value = '';
+
+  controller = new AbortController();
+  try {
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ messages: [{ role: 'user', content }] })
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ messages: [{ role:'user', content }] }),
+      signal: controller.signal
     });
-
     if (!res.ok || !res.body) {
-      out.textContent = 'Error contacting Tripp.';
+      out.textContent = `Error: ${res.status} ${res.statusText||''}`.trim();
       return;
     }
-
     const reader = res.body.getReader();
     const dec = new TextDecoder();
-
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      out.textContent += dec.decode(value, { stream: true });
+      out.textContent += dec.decode(value, { stream:true });
     }
-  });
-  </script>
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      out.textContent = 'Error contacting Tripp (rate limited or aborted).';
+    }
+  } finally {
+    btn.disabled = false; input.disabled = false; controller = null;
+  }
+});
+</script>
+
 </body>
 </html>
