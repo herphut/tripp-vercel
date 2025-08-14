@@ -46,7 +46,7 @@ export default async function handler(req) {
     model: 'gpt-4o-mini',
     messages,
     // Keep it non-streaming for now so calls finish quicker under tight limits
-    stream: false,
+    stream: true,
     max_tokens: 300,   // keep completions brief to avoid long holds
     temperature: 0.3
   };
