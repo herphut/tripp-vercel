@@ -1,150 +1,160 @@
-'use client';
+// app/api/chat/route.ts
+import { NextRequest, NextResponse } from 'next/server';
+import OpenAI from 'openai';
+import LRUCache from 'lru-cache';
+import { z } from 'zod';
 
-import { useState, useRef, useEffect, FormEvent } from 'react';
+// ---------- config ----------
+const RATE_LIMIT_REQUESTS = 20;        // requests per window
+const RATE_LIMIT_WINDOW_MS = 60_000;   // 1 minute
+const MAX_USER_MESSAGE_CHARS = 1000;   // keep it reasonable
+// -----------------------------
 
-type LocalChatMessage = {
-  role: 'user' | 'assistant';
-  content: string;
-};
+// Simple fixed-window IP rate limiter using LRU (good enough for now)
+type Counter = { count: number; resetAt: number };
+const rlCache = new LRUCache<string, Counter>({
+  max: 10_000, // up to 10k distinct IPs in memory
+  ttl: RATE_LIMIT_WINDOW_MS, // auto-evict after window (safety)
+});
 
-const STORAGE_KEY = 'tripp-chat-history-v1';
+// Extract a best-effort client IP from headers/req
+function getClientIp(req: NextRequest) {
+  const h = req.headers;
+  return (
+    h.get('x-vercel-forwarded-for') ||
+    h.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    h.get('x-real-ip') ||
+    // @ts-ignore - Next may populate .ip on Edge, but not everywhere
+    (req as any).ip ||
+    '0.0.0.0'
+  );
+}
 
-export default function ChatPage() {
-  const [messages, setMessages] = useState<LocalChatMessage[]>([
-    {
-      role: 'assistant',
-      content:
-        "Hi! I’m Tripp. You’re chatting with the new HerpHut AI. How can I help today?",
-    },
-  ]);
-  const [input, setInput] = useState('');
-  const [sending, setSending] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
+function checkRateLimit(ip: string) {
+  const now = Date.now();
+  const bucket = rlCache.get(ip);
+  if (!bucket) {
+    rlCache.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS }, { ttl: RATE_LIMIT_WINDOW_MS });
+    return { ok: true, remaining: RATE_LIMIT_REQUESTS - 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  }
+  if (now > bucket.resetAt) {
+    rlCache.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS }, { ttl: RATE_LIMIT_WINDOW_MS });
+    return { ok: true, remaining: RATE_LIMIT_REQUESTS - 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  }
+  if (bucket.count >= RATE_LIMIT_REQUESTS) {
+    return { ok: false, remaining: 0, resetAt: bucket.resetAt };
+  }
+  bucket.count += 1;
+  rlCache.set(ip, bucket, { ttl: bucket.resetAt - now });
+  return { ok: true, remaining: RATE_LIMIT_REQUESTS - bucket.count, resetAt: bucket.resetAt };
+}
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setMessages(JSON.parse(raw));
-    } catch {}
-  }, []);
+// Validate incoming body
+const MessageSchema = z.object({
+  role: z.enum(['user', 'assistant']),
+  content: z.string().min(1),
+});
+const BodySchema = z.object({
+  messages: z.array(MessageSchema).min(1),
+});
 
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (!input.trim()) return;
-
-    const userMessage: LocalChatMessage = { role: 'user', content: input };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
-    setSending(true);
-
-    try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: [...messages, userMessage] }),
-      });
-
-      if (!res.ok) throw new Error(`HTTP error! ${res.status}`);
-      const data = await res.json();
-
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: data.reply },
-      ]);
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content:
-            "Sorry—I’m off basking right now! 🦎☀️ I’ll be back shortly.",
+export async function POST(req: NextRequest) {
+  // 1) Rate limit
+  const ip = getClientIp(req);
+  const rl = checkRateLimit(ip);
+  if (!rl.ok) {
+    return NextResponse.json(
+      {
+        reply:
+          "Easy there, speedster! 🦎 I'm basking for a moment. Please try again in a bit.",
+        usage: null,
+        rate_limit: {
+          limit: RATE_LIMIT_REQUESTS,
+          remaining: rl.remaining,
+          reset_ms: Math.max(rl.resetAt - Date.now(), 0),
         },
-      ]);
-    } finally {
-      setSending(false);
-    }
+      },
+      {
+        status: 429,
+        headers: {
+          'X-RateLimit-Limit': String(RATE_LIMIT_REQUESTS),
+          'X-RateLimit-Remaining': String(rl.remaining),
+          'X-RateLimit-Reset': String(Math.ceil(rl.resetAt / 1000)),
+        },
+      }
+    );
   }
 
-  return (
-    <div style={{ maxWidth: '600px', margin: '0 auto', padding: '20px' }}>
-      <h2 style={{ textAlign: 'center', fontWeight: 'bold' }}>Chat with Tripp</h2>
+  // 2) Parse + sanity checks
+  let body: z.infer<typeof BodySchema>;
+  try {
+    body = BodySchema.parse(await req.json());
+  } catch (err) {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
+  }
 
-      <div
-        style={{
-          border: '1px solid #ccc',
-          borderRadius: '10px',
-          padding: '10px',
-          minHeight: '400px',
-          overflowY: 'auto',
-        }}
-      >
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            style={{
-              textAlign: m.role === 'user' ? 'right' : 'left',
-              margin: '10px 0',
-            }}
-          >
-            <span
-              style={{
-                display: 'inline-block',
-                padding: '10px',
-                borderRadius: '15px',
-                background: m.role === 'user' ? '#DCF8C6' : '#F1F0F0',
-                color: '#000',
-              }}
-            >
-              {m.content}
-            </span>
-          </div>
-        ))}
-        <div ref={scrollRef} />
-      </div>
+  const lastUser = [...body.messages].reverse().find(m => m.role === 'user');
+  if (!lastUser) {
+    return NextResponse.json({ error: 'No user message provided' }, { status: 400 });
+  }
+  if (lastUser.content.length > MAX_USER_MESSAGE_CHARS) {
+    return NextResponse.json(
+      { error: `Message too long (>${MAX_USER_MESSAGE_CHARS} chars)` },
+      { status: 413 }
+    );
+  }
 
-      <form
-        onSubmit={handleSubmit}
-        style={{ position: 'relative', marginTop: '10px' }}
-      >
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Type your message..."
-          style={{
-            width: '100%',
-            padding: '10px 50px 10px 15px',
-            borderRadius: '25px',
-            border: '1px solid #ccc',
-            outline: 'none',
-          }}
-        />
-        <button
-          type="submit"
-          disabled={sending}
-          style={{
-            position: 'absolute',
-            right: '5px',
-            top: '50%',
-            transform: 'translateY(-50%)',
-            width: '40px',
-            height: '40px',
-            borderRadius: '50%',
-            border: 'none',
-            background: '#22c55e',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: 'pointer',
-          }}
-        >
-          <img src="/lizard.svg" alt="Send" width={30} height={30} />
-        </button>
-      </form>
-    </div>
-  );
+  // 3) OpenAI call with graceful fallback
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    // Friendly on-brand fallback
+    return NextResponse.json(
+      {
+        reply:
+          "Oops—my heat lamp’s unplugged (API key missing). I’ll be back sunning soon. 🔌🦎",
+        usage: null,
+      },
+      { status: 200 }
+    );
+  }
+
+  const openai = new OpenAI({ apiKey });
+
+  try {
+    const system =
+      "You are Tripp, the HerpHut AI. Be concise, helpful, and friendly. Use 1–4 sentences unless asked for detail.";
+
+    // Call a budget-friendly model
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.7,
+      messages: [
+        { role: 'system', content: system },
+        ...body.messages.map(m => ({ role: m.role, content: m.content })),
+      ],
+      max_tokens: 300,
+    });
+
+    const reply =
+      resp.choices?.[0]?.message?.content?.trim() ||
+      "I’m here! (But I couldn’t quite form a reply.)";
+
+    return NextResponse.json(
+      {
+        reply,
+        usage: resp.usage ?? null,
+      },
+      { status: 200 }
+    );
+  } catch (e) {
+    // Friendly fallback on any error (timeouts, quota, network)
+    return NextResponse.json(
+      {
+        reply:
+          "Sorry—I’m off basking for a moment. Try me again in a few seconds! ☀️🦎",
+        usage: null,
+      },
+      { status: 200 }
+    );
+  }
 }
