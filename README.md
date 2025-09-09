@@ -1,45 +1,36 @@
-# tripp-vercel
-Tripp AI  - Vercel streaming chat endpoint
+This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
-# Tripp — HerpHut AI Reptile Assistant 🦎
+## Getting Started
 
-Tripp is HerpHut’s friendly AI that answers care questions, explains the “why,” and drops pro tips for keepers of all ages.  
-This repo contains the **standalone web app** (Vercel-ready) with a minimal chat UI and a secure serverless API route that talks to OpenAI.
-
-> TL;DR: Clone → set env vars → `npm run dev` → deploy to Vercel. No secrets in the browser. Ever.
-
----
-
-## Features
-- ⚡ Minimal, fast chat UI (mobile-friendly)
-- 🔐 Server-side API route (no client-side keys)
-- 🧰 Drop-in embed snippet for WordPress or any site
-- 🪪 Optional rate limiting + basic abuse protection
-- 🚀 One-click Vercel deploy via GitHub
-
----
-
-## Tech Stack
-- **Next.js** (App Router or Pages Router — either works)
-- **Node 18+**
-- **Vercel** (serverless functions)
-- **OpenAI API** (model configurable via env)
-
----
-
-## Prerequisites
-- Node.js 18+ and npm (or pnpm/yarn)
-- OpenAI API key
-- GitHub account (for CI/deploy)
-- Vercel account (for hosting)
-
----
-
-## Getting Started (Local)
+First, run the development server:
 
 ```bash
-git clone https://github.com/<you>/tripp-vercel.git
-cd tripp-vercel
-cp .env.example .env.local
-npm install
 npm run dev
+# or
+yarn dev
+# or
+pnpm dev
+# or
+bun dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
+You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+
+This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+
+## Learn More
+
+To learn more about Next.js, take a look at the following resources:
+
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+
+You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+
+## Deploy on Vercel
+
+The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
