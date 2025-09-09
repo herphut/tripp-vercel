@@ -1,55 +1,54 @@
 // app/api/chat/route.ts
-export const runtime = 'edge'; // faster/cheaper cold start on Vercel Edge
+import { NextRequest, NextResponse } from "next/server";
+import OpenAI from "openai";
+import { z } from "zod";
 
-import { NextRequest } from 'next/server';
-import OpenAI from 'openai';
+const MessagesSchema = z.object({
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(["system", "user", "assistant"]),
+        content: z.string().min(1),
+      })
+    )
+    .min(1),
+});
+type MessagesPayload = z.infer<typeof MessagesSchema>;
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
+  apiKey: process.env.OPENAI_API_KEY!, // set in Vercel Project → Settings → Environment Variables
 });
-
-type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const messages: ChatMessage[] = Array.isArray(body?.messages) ? body.messages : [];
+    const json = (await req.json()) as unknown;
+    const parsed = MessagesSchema.safeParse(json);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Invalid request body", issues: parsed.error.flatten() },
+        { status: 400 }
+      );
+    }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return new Response(JSON.stringify({ error: 'Missing OPENAI_API_KEY' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-    if (!messages.length) {
-      return new Response(JSON.stringify({ error: 'messages[] is required' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
+    const { messages }: MessagesPayload = parsed.data;
 
     const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.5,
+      model: "gpt-4o-mini",
       messages,
+      temperature: 0.7,
     });
 
-    const msg = resp.choices?.[0]?.message ?? { role: 'assistant', content: '' };
+    const reply = resp.choices[0]?.message?.content ?? "";
 
-    return new Response(JSON.stringify({ message: msg }), {
-      headers: { 'Content-Type': 'application/json' },
+    return NextResponse.json({
+      reply,
+      usage: resp.usage, // helpful for monitoring
     });
-  } catch (err: any) {
-    return new Response(JSON.stringify({ error: err?.message ?? 'Unexpected error' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  } catch (err) {
+    console.error("Chat route error:", err);
+    return NextResponse.json(
+      { error: "Internal Server Error" },
+      { status: 500 }
+    );
   }
-}
-
-// Optional quick sanity check: GET /api/chat -> 200 OK
-export async function GET() {
-  return new Response(JSON.stringify({ ok: true, route: '/api/chat' }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
 }
