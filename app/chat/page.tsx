@@ -142,7 +142,7 @@ export default function ChatPage() {
             cursor: 'pointer',
           }}
         >
-          <img src="/lizard.svg" alt="Send" width={20} height={20} />
+          <img src="/lizard.svg" alt="Send" width={30} height={30} />
         </button>
       </form>
     </div>
