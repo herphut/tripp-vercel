@@ -1,7 +1,7 @@
 // app/api/chat/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
-import LRUCache from 'lru-cache';
+import { LRUCache } from 'lru-cache';
 import { z } from 'zod';
 
 // ---------- config ----------
