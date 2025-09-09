@@ -47,7 +47,10 @@ export default function ChatPage() {
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: 'smooth',
+    });
   }, [messages, sending]);
 
   async function onSubmit(e: FormEvent) {
@@ -55,7 +58,9 @@ export default function ChatPage() {
     const trimmed = input.trim();
     if (!trimmed || sending) return;
 
-    const next = [...messages, { role: 'user', content: trimmed as string }];
+    const userMsg: LocalChatMessage = { role: 'user', content: trimmed };
+    const next: LocalChatMessage[] = [...messages, userMsg];
+
     setMessages(next);
     setInput('');
     setSending(true);
@@ -67,21 +72,21 @@ export default function ChatPage() {
         body: JSON.stringify({ messages: next }),
       });
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      const data = (await res.json()) as { reply: string };
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.reply }]);
-    } catch (err) {
+      const data: { reply: string } = await res.json();
       setMessages((prev) => [
         ...prev,
-        {
-          role: 'assistant',
-          content:
-            "Hmm… I had trouble reaching my brain. Please try again in a moment.",
-        },
+        { role: 'assistant', content: data.reply },
       ]);
+    } catch {
+      const fallbacks = [
+        "Sorry—I’m off basking in the sun. BRB!",
+        "Munching lunch—back in a sec!",
+        "Chasing crickets right now… try me again in a moment!",
+      ];
+      const msg = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+      setMessages((prev) => [...prev, { role: 'assistant', content: msg }]);
     } finally {
       setSending(false);
     }
@@ -90,9 +95,7 @@ export default function ChatPage() {
   return (
     <div className="min-h-[100svh] w-full bg-neutral-100 flex items-center justify-center p-4">
       <div className="w-full max-w-3xl">
-        <div className="mb-3 text-black font-semibold text-xl">
-          Chat with Tripp
-        </div>
+        <div className="mb-3 text-black font-semibold text-xl">Chat with Tripp</div>
 
         {/* Chat window */}
         <div
@@ -103,11 +106,11 @@ export default function ChatPage() {
             {messages.map((m, i) => (
               <li key={i} className="flex">
                 {m.role === 'assistant' ? (
-                  <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-neutral-100 border border-neutral-300 px-4 py-3 text-[15px] leading-relaxed text-neutral-900">
+                  <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-neutral-100 border border-neutral-300 px-4 py-3 text-[15px] leading-relaxed text-black">
                     {m.content}
                   </div>
                 ) : (
-                  <div className="ml-auto max-w-[85%] rounded-2xl rounded-tr-md bg-blue-50 border border-blue-200 px-4 py-3 text-[15px] leading-relaxed text-neutral-900">
+                  <div className="ml-auto max-w-[85%] rounded-2xl rounded-tr-md bg-blue-50 border border-blue-200 px-4 py-3 text-[15px] leading-relaxed text-black">
                     {m.content}
                   </div>
                 )}
@@ -119,7 +122,7 @@ export default function ChatPage() {
               <li className="flex">
                 <div className="max-w-[85%] rounded-2xl rounded-tl-md bg-neutral-100 border border-neutral-300 px-4 py-3">
                   <span
-                    className="text-sm text-neutral-700 animate-pulse"
+                    className="text-sm text-black animate-pulse"
                     aria-live="polite"
                     aria-busy="true"
                   >
@@ -137,7 +140,7 @@ export default function ChatPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder="Type your message…"
-            className="flex-1 h-11 rounded-xl border border-neutral-300 bg-white px-3 text-[15px] text-neutral-900 placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-blue-400"
+            className="flex-1 h-11 rounded-xl border border-neutral-300 bg-white px-3 text-[15px] text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-blue-400"
             aria-label="Type your message"
           />
           <button
@@ -152,7 +155,7 @@ export default function ChatPage() {
         {/* Small helper actions */}
         <div className="mt-2 flex gap-3">
           <button
-            className="text-sm text-neutral-600 underline-offset-2 hover:underline"
+            className="text-sm text-neutral-700 underline-offset-2 hover:underline"
             onClick={() => {
               setMessages([]);
               localStorage.removeItem(STORAGE_KEY);
@@ -161,9 +164,8 @@ export default function ChatPage() {
             Clear chat
           </button>
           <button
-            className="text-sm text-neutral-600 underline-offset-2 hover:underline"
+            className="text-sm text-neutral-700 underline-offset-2 hover:underline"
             onClick={() => {
-              // Seed a fresh greeting
               setMessages([
                 {
                   role: 'assistant',
