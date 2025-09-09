@@ -8,7 +8,7 @@ const STORAGE_KEY = 'tripp-chat-history-v1';
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<LocalChatMessage[]>([
-    { role: 'assistant', content: "Hi! I'm Tripp. You’re chatting with the new HerpHut AI. How can I help today?" },
+    { role: 'assistant' as const, content: "Hi! I'm Tripp. You’re chatting with the new HerpHut AI. How can I help today?" },
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -33,7 +33,7 @@ export default function ChatPage() {
     const text = input.trim();
     if (!text) return;
     setInput('');
-    const next = [...messages, { role: 'user', content: text }];
+    const next LocalChatMessage[] = [...messages, { role: 'user' as const, content: text }];
     setMessages(next);
     setSending(true);
     try {
@@ -44,7 +44,7 @@ export default function ChatPage() {
       });
       if (!res.ok) throw new Error(await res.text());
       const data: { reply: string } = await res.json();
-      setMessages(m => [...m, { role: 'assistant', content: data.reply }]);
+      setMessages(m => [...m, { role: 'assistant' as const, content: data.reply }]);
     } catch {
       setMessages(m => [...m, { role: 'assistant', content: "Sorry—out basking for a sec. Try again in a bit. 🦎" }]);
     } finally {
