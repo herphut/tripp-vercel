@@ -157,31 +157,50 @@ export default function ChatPage() {
                 padding: '8px',
               }}
             />
-        <button
+       <button
   type="submit"
   disabled={sending}
   style={{
-    border: 'none',
-    background: 'transparent',
+    width: 44,
+    height: 44,
+    borderRadius: '50%',
+    border: '1px solid rgba(255,255,255,0.35)',
+    background: 'linear-gradient(180deg, #34d399, #16a34a)', // green pill
+    display: 'grid',
+    placeItems: 'center',
     padding: 0,
     margin: 0,
     cursor: sending ? 'not-allowed' : 'pointer',
-    transition: 'transform 0.2s ease, filter 0.2s ease',
+    transition: 'box-shadow 0.2s ease, transform 0.05s ease',
   }}
   onMouseEnter={e => {
-    (e.currentTarget.firstChild as HTMLElement).style.transform = 'scale(1.2)';
-    (e.currentTarget.firstChild as HTMLElement).style.filter =
-      'drop-shadow(0 0 6px #22c55e)';
+    const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+    if (img) img.style.transform = 'scale(1.18)';
+    e.currentTarget.style.boxShadow = '0 0 10px #22c55e';
   }}
   onMouseLeave={e => {
-    (e.currentTarget.firstChild as HTMLElement).style.transform = 'scale(1)';
-    (e.currentTarget.firstChild as HTMLElement).style.filter = 'none';
+    const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+    if (img) img.style.transform = 'scale(1)';
+    e.currentTarget.style.boxShadow = 'none';
+  }}
+  onMouseDown={e => {
+    // tiny press feedback
+    e.currentTarget.style.transform = 'translateY(1px)';
+  }}
+  onMouseUp={e => {
+    e.currentTarget.style.transform = 'translateY(0)';
   }}
 >
   <img
     src="/lizard.svg"
     alt="Send"
-    style={{ width: 30, height: 30, display: 'block' }}
+    style={{
+      width: 30,
+      height: 30,
+      display: 'block',
+      transition: 'transform 0.2s ease',
+      filter: 'drop-shadow(0 0 0 transparent)', // reset
+    }}
   />
 </button>
 </form>
