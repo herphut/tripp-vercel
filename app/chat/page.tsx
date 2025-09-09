@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useRef, useState } from 'react';
 
-type ChatMessage = {
+type LocalChatMessage = {
   role: 'user' | 'assistant';
   content: string;
 };
@@ -10,7 +10,7 @@ type ChatMessage = {
 const STORAGE_KEY = 'tripp-chat-history-v1';
 
 export default function ChatPage() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
+  const [messages, setMessages] = useState<LocalChatMessage[]>([
     {
       role: 'assistant',
       content:
@@ -26,7 +26,7 @@ export default function ChatPage() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as ChatMessage[];
+        const parsed = JSON.parse(raw) as LocalChatMessage[];
         if (Array.isArray(parsed) && parsed.length) {
           setMessages(parsed);
         }
