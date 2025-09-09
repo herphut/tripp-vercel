@@ -18,17 +18,21 @@ const rlCache = new LRUCache<string, Counter>({
 });
 
 // Extract a best-effort client IP from headers/req
-function getClientIp(req: NextRequest) {
+import type { NextRequest } from 'next/server';
+
+function getClientIp(req: NextRequest): string {
   const h = req.headers;
-  return (
-    h.get('x-vercel-forwarded-for') ||
-    h.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-    h.get('x-real-ip') ||
-    // @ts-ignore - Next may populate .ip on Edge, but not everywhere
-    (req as any).ip ||
-    '0.0.0.0'
-  );
+  const forwarded =
+    h.get('x-vercel-forwarded-for') ??
+    h.get('x-forwarded-for') ??
+    h.get('x-real-ip');
+
+  // If multiple IPs, the first is the client’s
+  const ip = forwarded?.split(',')[0]?.trim();
+
+  return ip ?? '0.0.0.0'; // safe fallback (dev/unknown)
 }
+
 
 function checkRateLimit(ip: string) {
   const now = Date.now();
