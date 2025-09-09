@@ -33,7 +33,7 @@ export default function ChatPage() {
     const text = input.trim();
     if (!text) return;
     setInput('');
-    const next LocalChatMessage[] = [
+    const next: LocalChatMessage[] = [
       ...messages, 
       { role: 'user' as const, content: text }
     ];
