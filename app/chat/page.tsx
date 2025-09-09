@@ -1,26 +1,44 @@
 'use client';
 
 import { FormEvent, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 
-type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
+type LocalChatMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+};
 
 const STORAGE_KEY = 'tripp-chat-history-v1';
 
 export default function ChatPage() {
+  const router = useRouter();
+
+  // 🚦 Redirect safeguard (optional)
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.pathname === '/') {
+      router.push('/chat');
+    }
+  }, [router]);
+
   const [messages, setMessages] = useState<LocalChatMessage[]>([
-    { role: 'assistant' as const, content: "Hi! I'm Tripp. You’re chatting with the new HerpHut AI. How can I help today?" },
+    {
+      role: 'assistant',
+      content: "Hi! I'm Tripp. You're chatting with the new HerpHut AI. How can I help today?",
+    },
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // load/save local history
+  // Load from localStorage on mount
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) setMessages(JSON.parse(raw));
     } catch {}
   }, []);
+
+  // Save to localStorage + auto-scroll
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
@@ -33,12 +51,14 @@ export default function ChatPage() {
     const text = input.trim();
     if (!text) return;
     setInput('');
+
     const next: LocalChatMessage[] = [
-      ...messages, 
-      { role: 'user' as const, content: text }
+      ...messages,
+      { role: 'user' as const, content: text },
     ];
     setMessages(next);
     setSending(true);
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -49,89 +69,124 @@ export default function ChatPage() {
       const data: { reply: string } = await res.json();
       setMessages(m => [...m, { role: 'assistant' as const, content: data.reply }]);
     } catch {
-      setMessages(m => [...m, { role: 'assistant', content: "Sorry—out basking for a sec. Try again in a bit. 🦎" }]);
+      setMessages(m => [
+        ...m,
+        { role: 'assistant', content: "Sorry—out basking for a sec. Try again in a bit. 🦎" },
+      ]);
     } finally {
       setSending(false);
     }
   }
 
   return (
-    <div style={{ minHeight: '100vh', padding: 24, background: '#111', color: '#fff' }}>
-      <h2 style={{ textAlign: 'center', marginBottom: 16 }}>Chat with Tripp</h2>
+    <main
+      style={{
+        minHeight: '100vh',
+        background: '#0f1113',
+        padding: '24px 12px',
+        boxSizing: 'border-box',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'center' }}>
+        <div style={{ width: '100%', maxWidth: 900 }}>
+          <h2 style={{ textAlign: 'center', marginBottom: '16px', color: '#fff' }}>
+            Chat with Tripp
+          </h2>
 
-      <div
-        ref={scrollRef}
-        style={{
-          height: '60vh',
-          overflowY: 'auto',
-          border: '1px solid #777',
-          borderRadius: 12,
-          padding: 12,
-          marginBottom: 12,
-          background: '#1a1a1a',
-        }}
-      >
-        {messages.map((m, i) => (
+          {/* Chat window */}
           <div
-            key={i}
+            ref={scrollRef}
             style={{
-              margin: '8px 0',
-              display: 'flex',
-              justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start',
+              height: '65vh',
+              overflowY: 'auto',
+              border: '1px solid #444',
+              borderRadius: '12px',
+              padding: '12px',
+              marginBottom: '12px',
+              background: '#1a1c1f',
+              color: '#fff',
             }}
           >
-            <div
-              style={{
-                maxWidth: '75%',
-                padding: '10px 12px',
-                borderRadius: 12,
-                background: m.role === 'user' ? '#2a6' : '#eee',
-                color: m.role === 'user' ? '#fff' : '#111',
-              }}
-            >
-              {m.content}
-            </div>
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                style={{
+                  marginBottom: '8px',
+                  textAlign: m.role === 'user' ? 'right' : 'left',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'inline-block',
+                    padding: '8px 12px',
+                    borderRadius: '12px',
+                    background: m.role === 'user' ? '#22c55e' : '#333',
+                    color: m.role === 'user' ? '#000' : '#fff',
+                  }}
+                >
+                  {m.content}
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-        {sending && (
-          <div style={{ opacity: 0.8, fontStyle: 'italic', marginTop: 8, color: '#ccc' }}>
-            Tripp is thinking…
-          </div>
-        )}
-      </div>
 
-      <form onSubmit={onSubmit} style={{ display: 'flex', gap: 8 }}>
-        <input
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          placeholder="Type your message…"
-          style={{
-            flex: 1,
-            borderRadius: 999,
-            border: '1px solid #888',
-            padding: '12px 16px',
-            background: '#111',
-            color: '#fff',
-            outline: 'none',
-          }}
-        />
+          {/* Input + Send */}
+          <form
+            onSubmit={onSubmit}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              border: '1px solid #444',
+              borderRadius: '9999px',
+              padding: '4px 8px',
+              background: '#1a1c1f',
+            }}
+          >
+            <input
+              type="text"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              placeholder="Type your message..."
+              disabled={sending}
+              style={{
+                flex: 1,
+                border: 'none',
+                outline: 'none',
+                background: 'transparent',
+                color: '#fff',
+                padding: '8px',
+              }}
+            />
         <button
-          type="submit"
-          disabled={sending}
-          style={{
-            borderRadius: '999px',
-            width: 44,
-            height: 44,
-            border: 'none',
-            background: sending ? '#3a3' : '#4bd964',
-            cursor: sending ? 'default' : 'pointer',
-          }}
-          aria-label="Send"
-          title="Send"
-        >
-          🦎
-        </button>
-      </form>
-    </div>
+  type="submit"
+  disabled={sending}
+  style={{
+    border: 'none',
+    background: 'transparent',
+    padding: 0,
+    margin: 0,
+    cursor: sending ? 'not-allowed' : 'pointer',
+    transition: 'transform 0.2s ease, filter 0.2s ease',
+  }}
+  onMouseEnter={e => {
+    (e.currentTarget.firstChild as HTMLElement).style.transform = 'scale(1.2)';
+    (e.currentTarget.firstChild as HTMLElement).style.filter =
+      'drop-shadow(0 0 6px #22c55e)';
+  }}
+  onMouseLeave={e => {
+    (e.currentTarget.firstChild as HTMLElement).style.transform = 'scale(1)';
+    (e.currentTarget.firstChild as HTMLElement).style.filter = 'none';
+  }}
+>
+  <img
+    src="/lizard.svg"
+    alt="Send"
+    style={{ width: 30, height: 30, display: 'block' }}
+  />
+</button>
+</form>
+</div>
+</div>
+</main>
   );
 }
