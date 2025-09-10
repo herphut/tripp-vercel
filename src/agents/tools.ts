@@ -1,4 +1,6 @@
 // src/agents/tools.ts
+/* eslint-disable
+@typescript=eslint/no-explicit-any */
 import OpenAI from "openai";
 import { sql } from "@vercel/postgres";
 import type { NextRequest } from "next/server";
