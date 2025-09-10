@@ -13,13 +13,6 @@ const STORAGE_KEY = 'tripp-chat-history-v1';
 export default function ChatPage() {
   const router = useRouter();
 
-  // 🚦 Redirect safeguard (optional)
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.location.pathname === '/') {
-      router.push('/chat');
-    }
-  }, [router]);
-
   const [messages, setMessages] = useState<LocalChatMessage[]>([
     {
       role: 'assistant',
