@@ -1,40 +1,41 @@
+// app/api/session/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { sql } from "@vercel/postgres";
-import { randomUUID } from "crypto";
 
-export async function GET(req: NextRequest) {
-  const userKey = req.cookies.get("tripp_user")?.value; // ← use req.cookies
-  if (!userKey) return NextResponse.json([]);
+type SessionRow = { id: string; title: string | null; created_at: string; updated_at: string | null };
+type MessageRow = { role: "user" | "assistant" | "system"; content: string };
 
-  const { rows } = await sql`
-    SELECT id, title, updated_at
-    FROM chat_sessions
-    WHERE user_key = ${userKey}
-    ORDER BY updated_at DESC
-    LIMIT 10
+export async function POST() {
+  const r = await sql<Pick<SessionRow, "id">>`
+    INSERT INTO chat_sessions DEFAULT VALUES RETURNING id
   `;
-  return NextResponse.json(rows);
+  return NextResponse.json({ id: r.rows[0].id });
 }
 
-export async function POST(req: NextRequest) {
-  let userKey = req.cookies.get("tripp_user")?.value;
-  if (!userKey) userKey = randomUUID();
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const list = searchParams.get("list");
+  const id = searchParams.get("id");
 
-  const { title } = await req.json();
+  if (list) {
+    const r = await sql<SessionRow>`
+      SELECT id, title, created_at, updated_at
+      FROM chat_sessions
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC
+      LIMIT 20
+    `;
+    return NextResponse.json({ sessions: r.rows });
+  }
 
-  const { rows } = await sql`
-    INSERT INTO chat_sessions (user_key, title)
-    VALUES (${userKey}, ${title || "New chat"})
-    RETURNING id, title, created_at
-  `;
+  if (id) {
+    const r = await sql<MessageRow>`
+      SELECT role, content
+      FROM chat_messages
+      WHERE session_id = ${id}
+      ORDER BY created_at ASC
+    `;
+    return NextResponse.json({ messages: r.rows });
+  }
 
-  // set cookie on the response
-  const res = NextResponse.json(rows[0], { status: 201 });
-  res.cookies.set("tripp_user", userKey, {
-    httpOnly: true,
-    path: "/",
-    maxAge: 60 * 60 * 24 * 365,
-    sameSite: "lax",
-  });
-  return res;
+  return NextResponse.json({ error: "bad_request" }, { status: 400 });
 }
