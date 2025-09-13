@@ -1,41 +1,42 @@
 // app/api/session/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { sql } from "@vercel/postgres";
+import { db, schema } from "@/db/db";
+import { randomUUID } from "crypto";   // ✅ built-in, no npm install
+export const runtime = "nodejs";
 
-type SessionRow = { id: string; title: string | null; created_at: string; updated_at: string | null };
-type MessageRow = { role: "user" | "assistant" | "system"; content: string };
+export async function POST(req: NextRequest) {
+  try {
+    let user_id: string | null = null;
+    let client_id = req.headers.get("x-client-id") ?? "web-widget-v1";
 
-export async function POST() {
-  const r = await sql<Pick<SessionRow, "id">>`
-    INSERT INTO chat_sessions DEFAULT VALUES RETURNING id
-  `;
-  return NextResponse.json({ id: r.rows[0].id });
+    try {
+      const body = await req.json();
+      if (typeof body?.user_id === "string" && body.user_id.trim()) {
+        user_id = body.user_id.trim();
+      }
+      if (typeof body?.client_id === "string" && body.client_id.trim()) {
+        client_id = body.client_id.trim();
+      }
+    } catch { /* no/invalid JSON is fine */ }
+
+    const session_id = randomUUID();   // ✅ replace uuid.v4()
+
+    await db.insert(schema.chatSessions).values({
+      sessionId: session_id,
+      clientId: client_id,
+      userId: user_id,
+      tier: "free",
+    });
+
+    return NextResponse.json({ session_id }, { status: 201 });
+  } catch (e: any) {
+    return NextResponse.json(
+      { error: "session_create_failed", detail: String(e) },
+      { status: 500 }
+    );
+  }
 }
 
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const list = searchParams.get("list");
-  const id = searchParams.get("id");
-
-  if (list) {
-    const r = await sql<SessionRow>`
-      SELECT id, title, created_at, updated_at
-      FROM chat_sessions
-      ORDER BY updated_at DESC NULLS LAST, created_at DESC
-      LIMIT 20
-    `;
-    return NextResponse.json({ sessions: r.rows });
-  }
-
-  if (id) {
-    const r = await sql<MessageRow>`
-      SELECT role, content
-      FROM chat_messages
-      WHERE session_id = ${id}
-      ORDER BY created_at ASC
-    `;
-    return NextResponse.json({ messages: r.rows });
-  }
-
-  return NextResponse.json({ error: "bad_request" }, { status: 400 });
+export async function GET() {
+  return NextResponse.json({ ok: true, route: "session" });
 }

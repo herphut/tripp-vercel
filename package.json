@@ -7,32 +7,32 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "test-tripp": "tsx scripts/test-tripp.ts"
+    "test-tripp": "tsx scripts/test-tripp.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:check": "node -e \"console.log('DB URL present:', !!process.env.POSTGRES_URL)\""
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.0.1",
     "@openai/agents": "^0.1.1",
     "@vercel/postgres": "^0.10.0",
     "dotenv": "^17.2.2",
+    "drizzle-orm": "^0.44.5",
     "lru-cache": "^11.2.1",
     "next": "15.5.2",
     "openai": "^5.20.1",
     "papaparse": "^5.5.3",
     "pdf-parse": "^1.1.1",
     "react": "19.1.0",
-    "react-dom": "19.1.0",
-    "xlsx": "^0.18.5",
-    "zod": "^3.25.76"
+    "react-dom": "19.1.0"
   },
   "devDependencies": {
-    "@eslint/eslintrc": "^3",
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
+    "drizzle-kit": "^0.24.2",
     "eslint-config-next": "15.5.2",
     "tailwindcss": "^4",
-    "tsx": "^4.20.5",
+    "tsx": "^4.28.5",
     "typescript": "^5"
   }
 }
+
+

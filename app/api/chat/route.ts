@@ -1,84 +1,99 @@
 // app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import { db, schema } from "@/db/db";
+import { TRIPP_PROMPT } from "../../trippPrompt";
+import { asc, eq } from "drizzle-orm";
 import OpenAI from "openai";
-import { sql } from "@vercel/postgres";
-import { z } from "zod";
-import { TRIPP_PROMPT } from "@/agents/trippPrompt";
-import { rateLimit } from "@/lib/ratelimit";
-import { checkModeration } from "@/lib/moderation";
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+type Msg = { role: "user" | "assistant" | "system"; content: string };
+type Body = { session_id: string; user_id?: string | null; messages: Msg[] };
 
-const Msg = z.object({
-  role: z.enum(["system", "user", "assistant"]),
-  content: z.string(),
-});
-const RequestBody = z.object({
-  messages: z.array(Msg),
-  session_id: z.string().uuid().optional(),
-});
-type Message = z.infer<typeof Msg>;
-
-function clientKey(req: NextRequest): string {
-  const xf = req.headers.get("x-forwarded-for");
-  const ip = xf?.split(",")[0]?.trim() || "anon";
-  return `${ip}:/api/chat`;
+function haveKey(name: string) {
+  const v = process.env[name];
+  return !!v && v.trim() !== "";
 }
 
 export async function POST(req: NextRequest) {
-  // Rate limit
-  const { allowed, remaining, reset } = await rateLimit(clientKey(req));
-  const rl = {
-    "X-RateLimit-Limit": "30",
-    "X-RateLimit-Remaining": String(remaining),
-    "X-RateLimit-Reset": String(reset),
-  };
-  if (!allowed) {
-    return new NextResponse(
-      JSON.stringify({
-        error: "too_many_requests",
-        message: "Whoa there, speedy gecko! Try again soon.",
-      }),
-      { status: 429, headers: { ...rl, "Content-Type": "application/json" } }
-    );
-  }
+  try {
+    const body = (await req.json()) as Body;
+    if (!body?.session_id || !Array.isArray(body.messages) || body.messages.length === 0) {
+      return NextResponse.json({ error: "bad_request" }, { status: 400 });
+    }
+    const last = [...body.messages].reverse().find(m => m.role === "user");
+    if (!last?.content) {
+      return NextResponse.json({ error: "messages_required" }, { status: 400 });
+    }
 
-  // Parse body
-  const parsed = RequestBody.safeParse(await req.json());
-  if (!parsed.success) {
-    return NextResponse.json({ error: "bad_request" }, { status: 400, headers: rl });
-  }
-  const { messages, session_id } = parsed.data;
+    // Persist the user message
+    await db.insert(schema.chatMessages).values({
+      sessionId: body.session_id,
+      role: "user",
+      content: last.content,
+    });
 
-  // Moderation (last user)
-  const lastUser: Message | undefined = [...messages].reverse().find(m => m.role === "user");
-  const userText = lastUser?.content ?? "";
-  const mod = await checkModeration(userText);
-  if (mod.flagged) {
+    // If no key, return an echo so local dev still works
+    if (!haveKey("OPENAI_API_KEY")) {
+      const reply = `Echo: ${last.content}`;
+      return NextResponse.json({
+        messages: [
+          ...(await db
+            .select({
+              role: schema.chatMessages.role,
+              content: schema.chatMessages.content,
+              created_at: schema.chatMessages.createdAt,
+            })
+            .from(schema.chatMessages)
+            .where(eq(schema.chatMessages.sessionId, body.session_id))
+            .orderBy(asc(schema.chatMessages.createdAt))),
+          { role: "assistant", content: reply, created_at: new Date().toISOString() },
+        ],
+        diag: { openai_used: false, reason: "missing OPENAI_API_KEY" },
+      });
+    }
+
+    // Call OpenAI
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+    // Use the full Tripp system prompt
+    const system = TRIPP_PROMPT.trim();
+    const userText = last.content;
+
+
+    // Responses API (works with openai >= 4.x)
+    const resp = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: userText },
+      ],
+    });
+
+    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+
+    // Persist assistant message
+    await db.insert(schema.chatMessages).values({
+      sessionId: body.session_id,
+      role: "assistant",
+      content: assistantText,
+    });
+
+    // Read back conversation (proves select still happy)
+    const rows = await db
+      .select({
+        role: schema.chatMessages.role,
+        content: schema.chatMessages.content,
+        created_at: schema.chatMessages.createdAt,
+      })
+      .from(schema.chatMessages)
+      .where(eq(schema.chatMessages.sessionId, body.session_id))
+      .orderBy(asc(schema.chatMessages.createdAt));
+
+    return NextResponse.json({ messages: rows, diag: { openai_used: true } });
+  } catch (e: any) {
+    console.error("[chat] fatal", e);
     return NextResponse.json(
-      { error: "moderation_block", message: "I can’t help with that. Let’s keep it kid-safe! 🦎" },
-      { status: 400, headers: rl }
+      { error: "chat_route_failed", detail: String(e?.message ?? e) },
+      { status: 500, headers: { "content-type": "application/json" } }
     );
   }
-
-  // Persist user message (last only to avoid duplicates)
-  if (session_id && lastUser?.content) {
-    await sql`INSERT INTO chat_messages (session_id, role, content) VALUES (${session_id}, 'user', ${lastUser.content})`;
-    await sql`UPDATE chat_sessions SET updated_at = NOW() WHERE id = ${session_id}`;
-  }
-
-  // Model call (Responses API)
-  const resp = await openai.responses.create({
-    model: "gpt-4o-mini",
-    input: [{ role: "system", content: TRIPP_PROMPT }, ...messages],
-  });
-  const text = resp.output_text ?? "";
-
-  // Persist assistant message
-  if (session_id && text) {
-    await sql`INSERT INTO chat_messages (session_id, role, content) VALUES (${session_id}, 'assistant', ${text})`;
-    await sql`UPDATE chat_sessions SET updated_at = NOW() WHERE id = ${session_id}`;
-  }
-
-  return NextResponse.json({ text }, { status: 200, headers: rl });
 }
