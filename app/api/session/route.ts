@@ -1,40 +1,42 @@
+// app/api/session/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { sql } from "@vercel/postgres";
-import { randomUUID } from "crypto";
-
-export async function GET(req: NextRequest) {
-  const userKey = req.cookies.get("tripp_user")?.value; // ← use req.cookies
-  if (!userKey) return NextResponse.json([]);
-
-  const { rows } = await sql`
-    SELECT id, title, updated_at
-    FROM chat_sessions
-    WHERE user_key = ${userKey}
-    ORDER BY updated_at DESC
-    LIMIT 10
-  `;
-  return NextResponse.json(rows);
-}
+import { db, schema } from "@/db/db";
+import { randomUUID } from "crypto";   // ✅ built-in, no npm install
+export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
-  let userKey = req.cookies.get("tripp_user")?.value;
-  if (!userKey) userKey = randomUUID();
+  try {
+    let user_id: string | null = null;
+    let client_id = req.headers.get("x-client-id") ?? "web-widget-v1";
 
-  const { title } = await req.json();
+    try {
+      const body = await req.json();
+      if (typeof body?.user_id === "string" && body.user_id.trim()) {
+        user_id = body.user_id.trim();
+      }
+      if (typeof body?.client_id === "string" && body.client_id.trim()) {
+        client_id = body.client_id.trim();
+      }
+    } catch { /* no/invalid JSON is fine */ }
 
-  const { rows } = await sql`
-    INSERT INTO chat_sessions (user_key, title)
-    VALUES (${userKey}, ${title || "New chat"})
-    RETURNING id, title, created_at
-  `;
+    const session_id = randomUUID();   // ✅ replace uuid.v4()
 
-  // set cookie on the response
-  const res = NextResponse.json(rows[0], { status: 201 });
-  res.cookies.set("tripp_user", userKey, {
-    httpOnly: true,
-    path: "/",
-    maxAge: 60 * 60 * 24 * 365,
-    sameSite: "lax",
-  });
-  return res;
+    await db.insert(schema.chatSessions).values({
+      sessionId: session_id,
+      clientId: client_id,
+      userId: user_id,
+      tier: "free",
+    });
+
+    return NextResponse.json({ session_id }, { status: 201 });
+  } catch (e: any) {
+    return NextResponse.json(
+      { error: "session_create_failed", detail: String(e) },
+      { status: 500 }
+    );
+  }
+}
+
+export async function GET() {
+  return NextResponse.json({ ok: true, route: "session" });
 }
