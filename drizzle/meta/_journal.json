@@ -8,6 +8,13 @@
       "when": 1757676296377,
       "tag": "0000_skinny_sprite",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1758010594062,
+      "tag": "0001_wild_wallop",
+      "breakpoints": true
     }
   ]
 }

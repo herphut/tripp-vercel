@@ -1,9 +1,10 @@
 // src/agents/tools.ts
 import OpenAI from "openai";
-import { sql } from "@vercel/postgres";
+import { neon } from "@neondatabase/serverless";
 import type { NextRequest } from "next/server";
 import { redactPII } from "@/lib/redact";
 
+const sql = neon(process.env.POSTGRES_URL!);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 export type ToolContext = { request: NextRequest };
@@ -15,9 +16,9 @@ export interface Tool<Args, Result> {
   execute(args: Args, ctx: ToolContext): Promise<Result>;
 }
 
-type MemoryRow = { text: string };
 type Consent = "0" | "1";
 
+// --- helpers ---
 function userKeyFromRequest(req: NextRequest): string {
   const c = req.cookies.get("tripp_user")?.value;
   if (c) return c;
@@ -28,12 +29,11 @@ function userKeyFromRequest(req: NextRequest): string {
   const ua = req.headers.get("user-agent") || "ua";
   return `ip:${ip}|ua:${ua}`;
 }
-
 function vectorLiteral(emb: number[]): string {
   return `[${emb.join(",")}]`;
 }
 
-/** ---- memory_write ---- */
+// --- tools ---
 export const memoryWrite: Tool<{ text: string }, { ok: boolean; error?: string }> = {
   name: "memory_write",
   description: "Store a short, durable memory for this user (PII redacted).",
@@ -43,12 +43,12 @@ export const memoryWrite: Tool<{ text: string }, { ok: boolean; error?: string }
     required: ["text"],
   },
   async execute({ text }, { request }) {
-    if (!text) return { ok: false, error: "invalid_text" };
+    if (!text?.trim()) return { ok: false, error: "invalid_text" };
 
-    const consent: Consent | undefined = request.cookies.get("tripp_mem_consent")?.value as Consent | undefined;
+    const consent = request.cookies.get("tripp_mem_consent")?.value as Consent | undefined;
     if (consent !== "1") return { ok: false, error: "no_consent" };
 
-    const safe = await redactPII(text);
+    const safe = redactPII(text);
     const e = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: safe,
@@ -57,14 +57,13 @@ export const memoryWrite: Tool<{ text: string }, { ok: boolean; error?: string }
     const userKey = userKeyFromRequest(request);
 
     await sql`
-      INSERT INTO memories (user_key, text, embedding)
+      INSERT INTO tripp_memory (user_key, text, embedding)
       VALUES (${userKey}, ${safe}, ${vectorLiteral(emb)}::vector)
     `;
     return { ok: true };
   },
 };
 
-/** ---- memory_search ---- */
 export const memorySearch: Tool<{ query: string }, { hits: string[] }> = {
   name: "memory_search",
   description: "Retrieve up to 5 user-specific memories relevant to the query.",
@@ -74,7 +73,7 @@ export const memorySearch: Tool<{ query: string }, { hits: string[] }> = {
     required: ["query"],
   },
   async execute({ query }, { request }) {
-    if (!query) return { hits: [] };
+    if (!query?.trim()) return { hits: [] };
 
     const q = await openai.embeddings.create({
       model: "text-embedding-3-small",
@@ -83,14 +82,16 @@ export const memorySearch: Tool<{ query: string }, { hits: string[] }> = {
     const emb = q.data[0].embedding as number[];
     const userKey = userKeyFromRequest(request);
 
-    const res = await sql<MemoryRow>`
+    // No generic on the tag; cast the array result inline
+    const rows = (await sql`
       SELECT text
-      FROM memories
+      FROM tripp_memory
       WHERE user_key = ${userKey}
       ORDER BY embedding <-> ${vectorLiteral(emb)}::vector
       LIMIT 5
-    `;
-    return { hits: res.rows.map(r => r.text) };
+    `) as Array<{ text: string }>;
+
+    return { hits: rows.map((r) => r.text) };
   },
 };
 
