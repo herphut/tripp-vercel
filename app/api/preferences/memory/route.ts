@@ -1,111 +1,129 @@
 // app/api/preferences/memory/route.ts
-import { NextResponse } from "next/server";
-import { db, schema } from "@/db/db";
-import { and, eq } from "drizzle-orm";
-import { getCurrentUser, getCurrentSessionId } from "@/app/api/_lib/herphut_user";
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/src/db/db";
+import { userPrefs, chatSessions, auditLogs } from "@/src/db/schema";
+import { eq, and, desc, isNull } from "drizzle-orm";
 
-async function readSessionId(req: Request): Promise<string | null> {
-  const fromHeader = req.headers.get("x-session-id");
-  if (fromHeader) return fromHeader;
-  return await getCurrentSessionId();
+/**
+ * Helper: session cookie -> user_id
+ */
+async function userIdFromSession(sessionId?: string | null) {
+  if (!sessionId) return null;
+  const row = await db
+    .select({ userId: chatSessions.userId })
+    .from(chatSessions)
+    .where(and(eq(chatSessions.sessionId, sessionId), isNull(chatSessions.revokedAt)))
+    .orderBy(desc(chatSessions.createdAt))
+    .limit(1);
+  const u = row[0]?.userId ?? null;
+  return (u && String(u).length > 0) ? String(u) : null;
 }
 
-export async function GET(req: Request) {
-  const user = await getCurrentUser();
-  const sessionId = await readSessionId(req);
+/**
+ * GET -> { memoryOptIn: boolean, scope: "user" | "anonymous" }
+ * Reads from tripp.user_prefs based on current session's user.
+ */
+export async function GET(req: NextRequest) {
+  const t0 = Date.now();
+  try {
+    const sessionId = req.cookies.get("HH_SESSION_ID")?.value || null;
+    const userId = await userIdFromSession(sessionId);
 
-  // If logged-in, prefer user-level truth.
-  if (user?.email) {
-    const rows = await db
-      .select({ memoryOptIn: schema.users.memoryOptIn })
-      .from(schema.users)
-      .where(eq(schema.users.email, user.email));
-
-    // If no user row yet, fall back to session scope.
-    const memoryOptIn =
-      rows.length > 0 ? !!rows[0].memoryOptIn : false;
-
-    // snapshot into session if present
-    if (sessionId) {
-      await db
-        .insert(schema.chatSessions)
-        .values({ sessionId, clientId: "web", userId: null, memoryOptIn })
-        .onConflictDoNothing();
-      await db
-        .update(schema.chatSessions)
-        .set({ memoryOptIn, updatedAt: new Date() })
-        .where(eq(schema.chatSessions.sessionId, sessionId));
+    if (!userId) {
+      // anonymous or no valid session → default false, scope=anonymous
+      return NextResponse.json({ memoryOptIn: false, scope: "anonymous" });
     }
+
+    const rows = await db
+      .select({ memoryOptIn: userPrefs.memoryOptIn })
+      .from(userPrefs)
+      .where(eq(userPrefs.userId, userId))
+      .limit(1);
+
+    const memoryOptIn = rows[0]?.memoryOptIn ?? false;
+
+    // (optional) audit
+    try {
+      await db.insert(auditLogs).values({
+        route: "/preferences/memory",
+        status: 200,
+        clientId: null,
+        userId,
+        sessionId,
+        latencyMs: Date.now() - t0,
+        error: null,
+      });
+    } catch {}
 
     return NextResponse.json({ memoryOptIn, scope: "user" });
+  } catch (e: any) {
+    try {
+      await db.insert(auditLogs).values({
+        route: "/preferences/memory",
+        status: 500,
+        clientId: null,
+        userId: null,
+        sessionId: null,
+        latencyMs: 0,
+        error: String(e?.message || e),
+      });
+    } catch {}
+    return NextResponse.json({ error: "server_error" }, { status: 500 });
   }
-
-  // Anon session
-  if (sessionId) {
-    const rows = await db
-      .select({ memoryOptIn: schema.chatSessions.memoryOptIn })
-      .from(schema.chatSessions)
-      .where(eq(schema.chatSessions.sessionId, sessionId));
-    return NextResponse.json({ memoryOptIn: !!rows[0]?.memoryOptIn, scope: "session" });
-  }
-
-  return NextResponse.json({ memoryOptIn: false, scope: "session" });
 }
 
-export async function POST(req: Request) {
-  const body = await req.json().catch(() => ({}));
-  const nextValue: boolean = !!body?.memoryOptIn;
+/**
+ * POST body: { memoryOptIn: boolean }
+ * Upserts into tripp.user_prefs for the current user.
+ */
+export async function POST(req: NextRequest) {
+  const t0 = Date.now();
+  try {
+    const sessionId = req.cookies.get("HH_SESSION_ID")?.value || null;
+    const userId = await userIdFromSession(sessionId);
+    if (!userId) {
+      return NextResponse.json({ error: "no_active_session" }, { status: 401 });
+    }
 
-  const user = await getCurrentUser();
-  const sessionId = await readSessionId(req);
+    const body = await req.json().catch(() => ({}));
+    const memoryOptIn: boolean = !!body?.memoryOptIn;
 
-  if (user?.email) {
-    // Upsert user row by email with new flag
-    const existing = await db
-      .select({ id: schema.users.id })
-      .from(schema.users)
-      .where(eq(schema.users.email, user.email));
-
-    if (existing.length === 0) {
-      await db.insert(schema.users).values({
-        email: user.email,
-        memoryOptIn: nextValue,
+    const now = new Date();
+    // upsert: on conflict(user_id) update ...
+    await db
+      .insert(userPrefs)
+      .values({ userId, memoryOptIn, updatedAt: now })
+      .onConflictDoUpdate({
+        target: userPrefs.userId,
+        set: { memoryOptIn, updatedAt: now },
       });
-    } else {
-      await db
-        .update(schema.users)
-        .set({ memoryOptIn: nextValue, updatedAt: new Date() })
-        .where(eq(schema.users.email, user.email));
-    }
 
-    if (sessionId) {
-      await db
-        .insert(schema.chatSessions)
-        .values({ sessionId, clientId: "web", userId: null, memoryOptIn: nextValue })
-        .onConflictDoNothing();
-      await db
-        .update(schema.chatSessions)
-        .set({ memoryOptIn: nextValue, updatedAt: new Date() })
-        .where(eq(schema.chatSessions.sessionId, sessionId));
-    }
+    // (optional) audit
+    try {
+      await db.insert(auditLogs).values({
+        route: "/preferences/memory",
+        status: 200,
+        clientId: null,
+        userId,
+        sessionId,
+        latencyMs: Date.now() - t0,
+        error: null,
+      });
+    } catch {}
 
-    return NextResponse.json({ ok: true, scope: "user", memoryOptIn: nextValue });
+    return NextResponse.json({ ok: true, memoryOptIn, scope: "user" });
+  } catch (e: any) {
+    try {
+      await db.insert(auditLogs).values({
+        route: "/preferences/memory",
+        status: 500,
+        clientId: null,
+        userId: null,
+        sessionId: null,
+        latencyMs: 0,
+        error: String(e?.message || e),
+      });
+    } catch {}
+    return NextResponse.json({ error: "server_error" }, { status: 500 });
   }
-
-  // Anon session flow
-  if (sessionId) {
-    await db
-      .insert(schema.chatSessions)
-      .values({ sessionId, clientId: "anon", userId: null, memoryOptIn: nextValue })
-      .onConflictDoNothing();
-
-    await db
-      .update(schema.chatSessions)
-      .set({ memoryOptIn: nextValue, updatedAt: new Date() })
-      .where(eq(schema.chatSessions.sessionId, sessionId));
-
-    return NextResponse.json({ ok: true, scope: "session", memoryOptIn: nextValue });
-  }
-
-  return NextResponse.json({ ok: true, scope: "session", memoryOptIn: nextValue });
 }

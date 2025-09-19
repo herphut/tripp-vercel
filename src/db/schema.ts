@@ -12,64 +12,96 @@ import {
 
 export const tripp = pgSchema("tripp");
 
-/**
- * USERS
- * - Keeps your integer PK
- * - memoryOptIn already present (source of truth for signed-in users)
- */
+/* ------------------------------------------------------------------ */
+/* USER PREFERENCES (per-user consent + audit fields)                  */
+/* ------------------------------------------------------------------ */
+export const userPrefs = tripp.table(
+  "user_prefs",
+  {
+    // user_id is the PK so we can upsert on conflict(user_id)
+    userId: text("user_id").primaryKey(),
+    memoryOptIn: boolean("memory_opt_in").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+
+    // optional provenance (who/what set the preference last)
+    updatedBy: varchar("updated_by", { length: 64 }), // e.g., "user", "admin", "system"
+    source: varchar("source", { length: 64 }),        // e.g., "ui", "api", "migration"
+  }
+);
+
+/* ------------------------------------------------------------------ */
+/* USERS                                                               */
+/* ------------------------------------------------------------------ */
 export const users = tripp.table(
   "users",
   {
     id: serial("id").primaryKey(),
     email: varchar("email", { length: 255 }).notNull().unique(),
-    memoryOptIn: boolean("memory_opt_in").default(false).notNull(),
-    tier: varchar("tier", { length: 32 }).default("free").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    tier: varchar("tier", { length: 32 }).notNull().default("free"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    // (No direct userPrefs column here; that's a relation at the app level)
   },
   (t) => ({
     byEmail: index("users_email_idx").on(t.email),
   })
 );
 
-/**
- * CHAT SESSIONS
- * - Adds memoryOptIn snapshot at the session level (for anon & fast reads)
- * - Leaves userId as varchar(64) to match your current SSO/bridge flow
- */
+/* ------------------------------------------------------------------ */
+/* CHAT SESSIONS                                                       */
+/* ------------------------------------------------------------------ */
 export const chatSessions = tripp.table(
   "chat_sessions",
   {
     id: serial("id").primaryKey(),
     sessionId: varchar("session_id", { length: 64 }).notNull().unique(),
-    clientId: varchar("client_id", { length: 64 }).notNull(),
-    userId: varchar("user_id", { length: 64 }),
-    /** NEW: mirrors consent at session creation / toggle time */
-    memoryOptIn: boolean("memory_opt_in").default(false).notNull(),
-    tier: varchar("tier", { length: 32 }).default("free").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    clientId: varchar("client_id", { length: 64 }),
+    userId: varchar("user_id", { length: 64 }), // keep as varchar(64) to match your SSO bridge
+    tier: varchar("tier", { length: 32 }).notNull().default("free"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
+
+    lastSeen:  timestamp("last_seen",  { withTimezone: true }).defaultNow(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+
+    deviceHash: varchar("device_hash", { length: 128 }),
+    uaHash:     varchar("ua_hash",     { length: 128 }),
+    ipHash:     varchar("ip_hash",     { length: 128 }),
+
+    jti: varchar("jti", { length: 255 }),
+    kid: varchar("kid", { length: 255 }),
+    iss: varchar("iss", { length: 255 }),
+    aud: varchar("aud", { length: 255 }),
   },
   (t) => ({
-    byUser: index("chat_sessions_user_idx").on(t.userId),
+    byUser:   index("chat_sessions_user_idx").on(t.userId),
     byClient: index("chat_sessions_client_idx").on(t.clientId),
-    byCreated: index("chat_sessions_created_idx").on(t.createdAt),
+    byCreated:index("chat_sessions_created_idx").on(t.createdAt),
   })
 );
 
-/**
- * CHAT MESSAGES
- * - No structural change; uses sessionId as FK (logical)
- */
+/* ------------------------------------------------------------------ */
+/* CHAT MESSAGES                                                       */
+/* ------------------------------------------------------------------ */
 export const chatMessages = tripp.table(
   "chat_messages",
   {
     id: serial("id").primaryKey(),
     sessionId: varchar("session_id", { length: 64 }).notNull(),
+    userId: varchar("user_id", { length: 64 }), // optional; helps with exports/analytics
     role: varchar("role", { length: 16 }).notNull(), // 'user'|'assistant'|'system'
-    content: text("content").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+
+    // allow NULL so we can support redaction
+    content: text("content"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+
+    // optional redaction/telemetry helpers
+    contentLen: integer("content_len"),
+    contentSha256: varchar("content_sha256", { length: 64 }), // hex sha256 length
+    contentRedacted: boolean("content_redacted").notNull().default(false),
   },
   (t) => ({
     bySession: index("chat_messages_session_idx").on(t.sessionId),
@@ -77,56 +109,56 @@ export const chatMessages = tripp.table(
   })
 );
 
-/**
- * MEMORIES (long-term K/V per user + namespace)
- * - Tighten the uniqueness on (userId, namespace, key) to avoid dup keys
- *   If you already have dups, run a cleanup before applying the UNIQUE.
- */
+/* ------------------------------------------------------------------ */
+/* MEMORIES (long-term K/V per user + namespace)                       */
+/* ------------------------------------------------------------------ */
 export const memories = tripp.table(
   "memories",
   {
     id: serial("id").primaryKey(),
     userId: varchar("user_id", { length: 64 }).notNull(),
-    namespace: varchar("namespace", { length: 64 }).default("default").notNull(),
+    namespace: varchar("namespace", { length: 64 }).notNull().default("default"),
     key: varchar("key", { length: 128 }).notNull(),
     value: text("value").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     byUserNsKey: index("memories_user_ns_key_idx").on(t.userId, t.namespace, t.key),
-    // Optional hard guard (enable when clean): unique("memories_user_ns_key_uq").on(t.userId, t.namespace, t.key),
+    // When you're ready to enforce uniqueness, switch to:
+    // unique("memories_user_ns_key_uq").on(t.userId, t.namespace, t.key),
   })
 );
 
-/**
- * CLIENT USAGE (daily counters)
- */
+/* ------------------------------------------------------------------ */
+/* CLIENT USAGE (daily counters)                                       */
+/* ------------------------------------------------------------------ */
 export const clientUsage = tripp.table(
   "client_usage",
   {
     id: serial("id").primaryKey(),
     clientId: varchar("client_id", { length: 64 }).notNull(),
     userId: varchar("user_id", { length: 64 }),
-    ipHash: varchar("ip_hash", { length: 64 }), // hashed IP if needed
+    ipHash: varchar("ip_hash", { length: 64 }),
     date: varchar("date", { length: 10 }).notNull(), // YYYY-MM-DD
-    requests: integer("requests").default(0).notNull(),
-    tokensIn: integer("tokens_in").default(0).notNull(),
-    tokensOut: integer("tokens_out").default(0).notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    requests: integer("requests").notNull().default(0),
+    tokensIn: integer("tokens_in").notNull().default(0),
+    tokensOut: integer("tokens_out").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     byKey: index("client_usage_key_idx").on(t.clientId, t.userId, t.date),
   })
 );
 
-/**
- * AUDIT LOGS
- */
+/* ------------------------------------------------------------------ */
+/* AUDIT LOGS                                                          */
+/* ------------------------------------------------------------------ */
 export const auditLogs = tripp.table(
   "audit_logs",
   {
     id: serial("id").primaryKey(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     route: varchar("route", { length: 256 }).notNull(),
     status: integer("status").notNull(),
     clientId: varchar("client_id", { length: 128 }),
@@ -134,7 +166,6 @@ export const auditLogs = tripp.table(
     sessionId: varchar("session_id", { length: 64 }),
     latencyMs: integer("latency_ms"),
     error: text("error"),
-    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => ({
     byCreated: index("audit_logs_created_idx").on(t.createdAt),

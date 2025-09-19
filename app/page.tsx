@@ -6,22 +6,33 @@ import Sidebar from '../components/Sidebar';
 
 type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
 
-const LS_SESSION = 'tripp:sessionId';
-const LS_OPTIN = 'tripp:memoryOptIn';
-
-function getOrCreateSessionId(): string {
-  let sid = localStorage.getItem(LS_SESSION);
-  if (!sid) {
-    sid = crypto.randomUUID();
-    localStorage.setItem(LS_SESSION, sid);
+// ---------- tiny auth boot helpers ----------
+type ExchangeOK = { session_id: string; user_id: string; expires_at: string };
+async function exchange(): Promise<ExchangeOK> {
+  const r = await fetch('/api/auth/exchange', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'content-type': 'application/json' },
+  });
+  if (r.status === 401) {
+    // Expect { refresh: "https://herphut.com/?hh_sso_refresh=1&return=..." }
+    const { refresh } = await r.json().catch(() => ({}));
+    if (refresh) window.location.href = refresh;
+    throw new Error('needs refresh');
   }
-  return sid;
+  if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
+  return r.json();
 }
 
-function useMemoryOptIn(): boolean {
-  if (typeof window === 'undefined') return false;
-  return localStorage.getItem(LS_OPTIN) === 'true';
+async function getMemoryPref(): Promise<{ memoryOptIn: boolean; scope?: string }> {
+  const r = await fetch('/api/preferences/memory', {
+    method: 'GET',
+    credentials: 'include',
+  });
+  if (!r.ok) throw new Error(`pref failed: ${r.status}`);
+  return r.json();
 }
+// --------------------------------------------
 
 function NewChatLink({ onClick, visible }: { onClick: () => void; visible: boolean }) {
   if (!visible) return null;
@@ -42,30 +53,56 @@ export default function ChatPage() {
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
 
-  const sessionId = typeof window !== 'undefined' ? getOrCreateSessionId() : '';
-  const optedIn = useMemoryOptIn();
+  // boot state
+  const [ready, setReady] = useState(false);
+  const [bootErr, setBootErr] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [memoryEnabled, setMemoryEnabled] = useState(false);
+
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
+  // Sidebar session select (unchanged)
   useEffect(() => {
-  function onSelect(e: Event) {
-    const id = (e as CustomEvent<string>).detail;
-    // TODO: load that session's messages or navigate:
-    // router.push(`/chat?session=${id}`)
-    // or call your loader to replace local messages state.
-    console.log("selected session", id);
-  }
-  window.addEventListener("tripp:selectSession", onSelect as EventListener);
-  return () => window.removeEventListener("tripp:selectSession", onSelect as EventListener);
-}, []);
+    function onSelect(e: Event) {
+      const id = (e as CustomEvent<string>).detail;
+      console.log('selected session', id);
+      // optionally load that session's messages here
+    }
+    window.addEventListener('tripp:selectSession', onSelect as EventListener);
+    return () => window.removeEventListener('tripp:selectSession', onSelect as EventListener);
+  }, []);
 
- function handleNewChat() {
-    // UI-only: start a fresh local thread; server will segment by session_id anyway if you want
+  // --------- BOOT: exchange + memory pref ----------
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const x = await exchange(); // sets HH_SESSION_ID cookie + returns ids
+        if (cancelled) return;
+        setSessionId(x.session_id);
+        setUserId(x.user_id);
+
+        const pref = await getMemoryPref();
+        if (cancelled) return;
+        setMemoryEnabled(!!pref.memoryOptIn);
+      } catch (e: any) {
+        setBootErr(e?.message || 'boot failed');
+      } finally {
+        setReady(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  // -------------------------------------------------
+
+  function handleNewChat() {
     setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
   }
 
@@ -73,21 +110,26 @@ export default function ChatPage() {
     e.preventDefault();
     const text = input.trim();
     if (!text || sending) return;
-    setInput('');
+    if (!sessionId) {
+      setMessages((m) => [...m, { role: 'assistant', content: 'No session yet—try again in a second.' }]);
+      return;
+    }
 
+    setInput('');
     const optimistic: LocalChatMessage[] = [...messages, { role: 'user', content: text }];
     setMessages(optimistic);
     setSending(true);
 
     try {
-      const memoryHint = optedIn;
       const res = await fetch('/api/chat', {
         method: 'POST',
+        credentials: 'include', // ensure cookies go with the request
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
-          messages: [{ role: 'user', content: text }], // server only needs the last user turn
-          memoryHint, // optional telemetry only
+          user_id: userId,
+          messages: [{ role: 'user', content: text }], // server only needs latest turn
+          memoryEnabled, // let server decide whether to persist
         }),
       });
       if (!res.ok) throw new Error(await res.text());
@@ -107,19 +149,27 @@ export default function ChatPage() {
     }
   }
 
+  // simple boot UX
+  if (!ready) return <div style={{ padding: 24, color: '#fff' }}>Starting Tripp…</div>;
+  if (bootErr) return <div style={{ padding: 24, color: '#fff' }}>Auth error: {bootErr}</div>;
+
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
       {/* LEFT: Sidebar — place NewChatLink just above recent chats */}
       <Sidebar
-        headerExtra={<NewChatLink onClick={handleNewChat} visible={optedIn} />}
-        /* If Sidebar doesn’t have headerExtra, add it there; otherwise place this link in its header manually. */
+        headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
       />
 
       {/* RIGHT: Chat UI */}
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'center' }}>
           <div style={{ width: '100%', maxWidth: 900 }}>
-            <h2 style={{ textAlign: 'center', marginBottom: '16px' }}>Chat with Tripp</h2>
+            {/* tiny debug header */}
+            <small style={{ opacity: 0.7 }}>
+              session: {sessionId?.slice(0, 8)}… • user: {userId ?? 'anon'} • memory: {memoryEnabled ? 'ON' : 'OFF'}
+            </small>
+
+            <h2 style={{ textAlign: 'center', margin: '12px 0 16px' }}>Chat with Tripp</h2>
 
             <div
               ref={scrollRef}
@@ -200,7 +250,7 @@ export default function ChatPage() {
                 onMouseLeave={(e) => {
                   const img = e.currentTarget.querySelector('img') as HTMLElement | null;
                   if (img) img.style.transform = 'scale(1)';
-                  (e.currentTarget as HTMLButtonElement).style.boxShadow = 'none';
+                  (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
                 }}
                 onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
                 onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}

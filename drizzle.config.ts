@@ -8,5 +8,5 @@ export default {
   verbose: true,
   strict: true,
   // optional, but helps introspect focus:
-  // tablesFilter: ["tripp.*"],    // only pull tables from the tripp schema,
+  tablesFilter: ["tripp.*"],    // only pull tables from the tripp schema,
 } satisfies Config;
