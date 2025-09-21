@@ -1,24 +1,35 @@
 // src/lib/prefs.ts
-import { db } from "@/src/db";
+import { db } from "@/src/db/db";
 import { userPrefs } from "@/src/db/schema";
 import { eq } from "drizzle-orm";
 
-export async function ensurePrefsRow(userId: string) {
-  await db.insert(userPrefs)
-    .values({ userId, memoryOptIn: false })
-    .onConflictDoNothing(); // safe if already there
+/**
+ * Read-only: return user's current memory opt-in.
+ * If no row exists, treat as false (do NOT create a row here).
+ */
+export async function readPrefs(userId: string): Promise<boolean> {
+  if (!userId) return false;
+  const r = await db
+    .select({ on: userPrefs.memoryOptIn })
+    .from(userPrefs)
+    .where(eq(userPrefs.userId, userId))
+    .limit(1);
+  return !!r[0]?.on;
 }
 
-export async function readPrefs(userId: string) {
-  await ensurePrefsRow(userId);
-  const row = await db.query.userPrefs.findFirst({ where: (t, { eq }) => eq(t.userId, userId) });
-  return !!row?.memoryOptIn;
-}
-
-export async function writePrefs(userId: string, on: boolean) {
-  await ensurePrefsRow(userId);
-  await db.update(userPrefs)
-    .set({ memoryOptIn: on, updatedAt: new Date() })
-    .where(eq(userPrefs.userId, userId));
+/**
+ * Single writer: UPSERT the preference.
+ * This is the only place that should write to tripp.user_prefs.
+ */
+export async function writePrefs(userId: string, on: boolean): Promise<boolean> {
+  if (!userId) throw new Error("invalid_user_id");
+  const now = new Date();
+  await db
+    .insert(userPrefs)
+    .values({ userId, memoryOptIn: on, updatedAt: now })
+    .onConflictDoUpdate({
+      target: userPrefs.userId,
+      set: { memoryOptIn: on, updatedAt: now },
+    });
   return on;
 }
