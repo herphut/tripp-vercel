@@ -3,6 +3,7 @@
 import type { FormEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import Sidebar from '../components/Sidebar';
+import { getMemoryPref } from '@/src/lib/session'; // <-- uses /api/prefs
 
 type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
 
@@ -15,21 +16,12 @@ async function exchange(): Promise<ExchangeOK> {
     headers: { 'content-type': 'application/json' },
   });
   if (r.status === 401) {
-    // Expect { refresh: "https://herphut.com/?hh_sso_refresh=1&return=..." }
+    // Expect { refresh: "https://herphut.com/sso/refresh?return=..." }
     const { refresh } = await r.json().catch(() => ({}));
     if (refresh) window.location.href = refresh;
     throw new Error('needs refresh');
   }
   if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
-  return r.json();
-}
-
-async function getMemoryPref(): Promise<{ memoryOptIn: boolean; scope?: string }> {
-  const r = await fetch('/api/preferences/memory', {
-    method: 'GET',
-    credentials: 'include',
-  });
-  if (!r.ok) throw new Error(`pref failed: ${r.status}`);
   return r.json();
 }
 // --------------------------------------------
@@ -79,6 +71,23 @@ export default function ChatPage() {
     return () => window.removeEventListener('tripp:selectSession', onSelect as EventListener);
   }, []);
 
+  // Reflect memory toggle changes from Settings (and cross-tab via localStorage)
+  useEffect(() => {
+    function onChanged(ev: Event) {
+      const next = (ev as CustomEvent<boolean>).detail;
+      setMemoryEnabled(!!next);
+    }
+    function onStorage(ev: StorageEvent) {
+      if (ev.key === 'tripp:memoryOptIn') setMemoryEnabled(ev.newValue === 'true');
+    }
+    window.addEventListener('tripp:memoryChanged', onChanged as EventListener);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener('tripp:memoryChanged', onChanged as EventListener);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
   // --------- BOOT: exchange + memory pref ----------
   useEffect(() => {
     let cancelled = false;
@@ -89,9 +98,10 @@ export default function ChatPage() {
         setSessionId(x.session_id);
         setUserId(x.user_id);
 
-        const pref = await getMemoryPref();
+        const on = await getMemoryPref(); // <-- now uses /api/prefs
         if (cancelled) return;
-        setMemoryEnabled(!!pref.memoryOptIn);
+        setMemoryEnabled(on);
+        localStorage.setItem('tripp:memoryOptIn', String(on));
       } catch (e: any) {
         setBootErr(e?.message || 'boot failed');
       } finally {
@@ -129,7 +139,7 @@ export default function ChatPage() {
           session_id: sessionId,
           user_id: userId,
           messages: [{ role: 'user', content: text }], // server only needs latest turn
-          memoryEnabled, // let server decide whether to persist
+          memoryEnabled, // server decides whether to persist
         }),
       });
       if (!res.ok) throw new Error(await res.text());

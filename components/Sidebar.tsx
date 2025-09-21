@@ -4,6 +4,7 @@
 import * as React from "react";
 import { useEffect, useState } from "react";
 import MemoryToggle from "@/components/settings/MemoryToggle";
+import { getMemoryPref } from "@/src/lib/session"; // <- new helper you added
 
 type Session = {
   id: string;
@@ -23,42 +24,27 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
   const [optedIn, setOptedIn] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
-  // Ensure cookie mirrors local session id and return it
-  function ensureSessionCookie(): string {
-    let sid = localStorage.getItem("tripp:sessionId");
-    if (!sid) {
-      sid = (crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2));
-      localStorage.setItem("tripp:sessionId", sid);
-    }
-    // 1-year cookie; SameSite=Lax
-    document.cookie = `session_id=${sid}; Path=/; Max-Age=31536000; SameSite=Lax`;
-    return sid;
-  }
-
-  // On mount: ensure cookie + fetch server truth once (source of truth)
+  // Fetch server-truth for memory on mount
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      try {
-        const sid = ensureSessionCookie();
-        const res = await fetch("/api/preferences/memory", {
-          headers: { "X-Session-Id": sid },
-          cache: "no-store",
-        });
-        const data = await res.json();
-        const val = !!data?.memoryOptIn;
-        setOptedIn(val);
-        localStorage.setItem("tripp:memoryOptIn", String(val));
-      } catch {
-        // ignore network hiccups
+      const on = await getMemoryPref();
+      if (!cancelled) {
+        setOptedIn(on);
+        localStorage.setItem("tripp:memoryOptIn", String(on));
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // React immediately when the toggle changes (via custom event) and cross-tab LS updates
+  // React immediately when the toggle changes (custom event) and cross-tab LS updates
   useEffect(() => {
     function onChanged(ev: Event) {
       const next = (ev as CustomEvent<boolean>).detail;
       setOptedIn(!!next);
+      localStorage.setItem("tripp:memoryOptIn", String(!!next));
     }
     function onStorage(ev: StorageEvent) {
       if (ev.key === "tripp:memoryOptIn") setOptedIn(ev.newValue === "true");
@@ -77,19 +63,27 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
       setSessions([]);
       return;
     }
+    let cancelled = false;
     (async () => {
       setLoading(true);
       try {
-        const res = await fetch("/api/session?list=1", { cache: "no-store" });
+        const res = await fetch("/api/session?list=1", {
+          cache: "no-store",
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
         const json = await res.json();
-        const arr: unknown = Array.isArray(json) ? json : json?.sessions;
-        setSessions(Array.isArray(arr) ? (arr as Session[]) : []);
+        const arr: unknown = Array.isArray(json) ? json : (json?.sessions as unknown);
+        if (!cancelled) setSessions(Array.isArray(arr) ? (arr as Session[]) : []);
       } catch {
-        setSessions([]);
+        if (!cancelled) setSessions([]);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [optedIn]);
 
   function select(id: string) {
@@ -99,7 +93,10 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
 
   async function clearSessionHistory() {
     if (!confirm("Clear this session's chat history?")) return;
-    await fetch("/api/preferences/clear", { method: "POST" }).catch(() => {});
+    await fetch("/api/preferences/clear", {
+      method: "POST",
+      credentials: "include",
+    }).catch(() => {});
     window.dispatchEvent(new CustomEvent("tripp:clearedSession"));
   }
 
@@ -127,7 +124,6 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
             <div className="text-sm opacity-80">
               Turn on memory to see recent chats here.
             </div>
-            {/* Open Settings button (only shows when not opted-in) */}
             <button
               onClick={() => setShowSettings(true)}
               className="text-sm px-3 py-2 rounded border border-zinc-700 hover:bg-zinc-800"
@@ -146,7 +142,7 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
                   <li key={s.id}>
                     <button
                       onClick={() => select(s.id)}
-                      className="w-full text-left px-3 py-2 rounded-md bg-[#1f2328] border border-[#30363d] hover:bg-[#242a31] transition"
+                      className="w-full text-left px-3 py-2 rounded-md bg-[#1f2328] border border-[#30363d] hover:bg[#242a31] transition"
                     >
                       <div className="text-sm">
                         {s.title ?? `Chat ${s.id.slice(0, 8)}`}

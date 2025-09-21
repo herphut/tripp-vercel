@@ -3,8 +3,24 @@
 import { useEffect, useState } from "react";
 
 type PrefsResp =
-  | { memory_opt_in: boolean }              // success
-  | { error: string; reason?: string };     // error shape
+  | { memory_opt_in: boolean }
+  | { memoryOptIn: boolean }
+  | { error: string; reason?: string }
+  | Record<string, unknown>;
+
+function readBoolShape(j: PrefsResp): boolean | null {
+  if (j && typeof j === "object") {
+    if ("memory_opt_in" in j) return !!(j as any).memory_opt_in;
+    if ("memoryOptIn" in j) return !!(j as any).memoryOptIn;
+    // tolerate { data: { memory_opt_in } } wrappers just in case
+    const data = (j as any).data;
+    if (data && typeof data === "object") {
+      if ("memory_opt_in" in data) return !!data.memory_opt_in;
+      if ("memoryOptIn" in data) return !!data.memoryOptIn;
+    }
+  }
+  return null;
+}
 
 export default function MemoryToggle() {
   const [on, setOn] = useState<boolean | null>(null);
@@ -21,24 +37,31 @@ export default function MemoryToggle() {
           method: "GET",
           credentials: "include",
           cache: "no-store",
-          headers: { "Accept": "application/json" },
+          headers: { Accept: "application/json" },
         });
         const j = (await r.json()) as PrefsResp;
+        const v = readBoolShape(j);
         if (!cancelled) {
-          if ("memory_opt_in" in j) setOn(!!j.memory_opt_in);
-          else {
+          if (v === null) {
             setOn(false);
-            setErr(j.error || "prefs_error");
+            setErr((j as any)?.error || "bad_shape");
+            console.debug("[MemoryToggle] GET /api/prefs unexpected payload:", j);
+          } else {
+            setOn(v);
+            setErr(null);
           }
         }
-      } catch (e: any) {
+      } catch (e) {
         if (!cancelled) {
           setOn(false);
-          setErr("prefs_fetch_failed");
+          setErr("fetch_failed");
+          console.debug("[MemoryToggle] GET /api/prefs failed:", e);
         }
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function toggle() {
@@ -53,31 +76,29 @@ export default function MemoryToggle() {
       const r = await fetch("/api/prefs", {
         method: "POST",
         credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json",
-        },
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ memory_opt_in: next }),
       });
-
       const j = (await r.json()) as PrefsResp;
-      if ("memory_opt_in" in j) {
-        setOn(!!j.memory_opt_in); // confirm server truth
+      const v = readBoolShape(j);
+      if (v === null) {
+        setOn(!next); // rollback
+        setErr((j as any)?.error || "set_bad_shape");
+        console.debug("[MemoryToggle] POST /api/prefs unexpected payload:", j);
       } else {
-        // rollback on server error
-        setOn(!next);
-        setErr(j.error || "prefs_set_error");
+        setOn(v); // confirm truth from server
+        setErr(null);
       }
-    } catch {
+    } catch (e) {
       setOn(!next); // rollback on network error
-      setErr("prefs_network_error");
+      setErr("set_failed");
+      console.debug("[MemoryToggle] POST /api/prefs failed:", e);
     } finally {
       setSaving(false);
     }
   }
 
-  const label =
-    on === null ? "…" : on ? "Memory: On" : "Memory: Off";
+  const label = on === null ? "…" : on ? "Memory: On" : "Memory: Off";
 
   return (
     <div className="flex items-center gap-2">
@@ -90,11 +111,7 @@ export default function MemoryToggle() {
       >
         {label}
       </button>
-      {err && (
-        <span className="text-xs text-white/60" title={err}>
-          (sync issue)
-        </span>
-      )}
+      {err && <span className="text-xs text-white/60">(sync issue)</span>}
     </div>
   );
 }

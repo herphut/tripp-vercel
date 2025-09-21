@@ -1,28 +1,33 @@
-// src/lib/session.ts
-export type ExchangeOK = { session_id: string; user_id: string; expires_at: string };
+export type MemoryOptIn = boolean;
 
-export async function exchange(): Promise<ExchangeOK> {
-  const r = await fetch("/api/auth/exchange", {
-    method: "POST",
-    credentials: "include", // <-- critical for cookies
-    headers: { "content-type": "application/json" },
-  });
-
-  if (r.status === 401) {
-    // Server should return { refresh: "https://herphut.com/?hh_sso_refresh=1&return=..." }
-    const { refresh } = await r.json().catch(() => ({}));
-    if (refresh) window.location.href = refresh;
-    throw new Error("401: needs refresh");
+function readBoolShape(j: any): MemoryOptIn | null {
+  if (j && typeof j === "object") {
+    if ("memory_opt_in" in j) return !!j.memory_opt_in;  // new route
+    if ("memoryOptIn" in j)   return !!j.memoryOptIn;     // old shape (tolerate)
+    if (j.data && typeof j.data === "object") {
+      if ("memory_opt_in" in j.data) return !!j.data.memory_opt_in;
+      if ("memoryOptIn"   in j.data) return !!j.data.memoryOptIn;
+    }
   }
-  if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
-  return r.json();
+  return null;
 }
 
-export async function getMemoryPref(): Promise<{ memoryOptIn: boolean }> {
-  const r = await fetch("/api/preferences/memory", {
+export async function getMemoryPref(): Promise<MemoryOptIn> {
+  const r = await fetch("/api/prefs", {
     method: "GET",
     credentials: "include",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
   });
-  if (!r.ok) throw new Error(`pref fetch failed: ${r.status}`);
-  return r.json();
+
+  // unauthenticated → off
+  if (r.status === 401) return false;
+
+  if (!r.ok) {
+    console.debug("[getMemoryPref] /api/prefs failed:", r.status);
+    return false;
+  }
+  const j = await r.json();
+  const v = readBoolShape(j);
+  return v ?? false;
 }
