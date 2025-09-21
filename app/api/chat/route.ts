@@ -4,8 +4,12 @@ import { db, schema } from "@/db/db";
 import { asc, eq } from "drizzle-orm";
 import OpenAI from "openai";
 import { TRIPP_PROMPT } from "@/app/api/_lib/trippPrompt";
-import { shouldPersist, getIdentity } from "../_lib/persistence";
+import { getIdentity } from "../_lib/persistence"; // keep your existing identity helper
 import { auditLog } from "../_lib/audit";
+
+// ✅ NEW: DB-driven prefs + JWT verify
+import { readPrefs } from "@/src/lib/prefs";        // ensurePrefsRow/readPrefs as we created
+import { verifyJwtRS256 } from "@/lib/jwtVerify";   // your existing verifier
 
 const system = TRIPP_PROMPT;
 
@@ -17,9 +21,40 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
+// --- NEW: get user id from HH_ID_TOKEN (server-side) ---
+async function userIdFromToken(req: NextRequest): Promise<string | null> {
+  // cookie helper (raw fallback just in case)
+  const rawCookie = req.cookies.get("HH_ID_TOKEN")?.value
+    ?? (req.headers.get("cookie") || "")
+      .split("; ")
+      .find(s => s.startsWith("HH_ID_TOKEN="))
+      ?.split("=")[1];
+
+  if (!rawCookie) return null;
+  try {
+    const { payload } = await verifyJwtRS256(rawCookie);
+    const uid = String(payload.sub || "");
+    return uid || null;
+  } catch {
+    return null;
+  }
+}
+
+// --- NEW: single source of truth for memory persistence ---
+async function shouldPersist(req: NextRequest): Promise<boolean> {
+  const uid = await userIdFromToken(req);
+  if (!uid) return false;         // no user → no memory
+  try {
+    // readPrefs ensures row exists (defaults to false if missing)
+    return await readPrefs(uid);
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
-  const { client_id, user_id } = await getIdentity(req);
+  const { client_id, user_id } = await getIdentity(req); // keep your diagnostic identity
 
   try {
     const body = (await req.json()) as Body;
@@ -50,16 +85,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "messages_required" }, { status: 400 });
     }
 
-    // 1) Decide if this session should persist messages (consent-aware)
+    // 1) Decide if this session should persist messages (DB-driven)
     const persist = await shouldPersist(req);
 
-    // 2) Ensure there is a chat_sessions row (insert-or-ignore)
+    // 2) Ensure there is a chat_sessions row (insert-or-ignore; minimal)
     try {
       await db
         .insert(schema.chatSessions)
         .values({
           sessionId: body.session_id,
-          clientId: client_id ?? "anon",
+          clientId: client_id ?? "anon",   // fine; your table has NOT NULL on client_id
           userId: user_id ?? null,
         })
         .onConflictDoNothing();
@@ -67,7 +102,7 @@ export async function POST(req: NextRequest) {
       // best-effort; don't fail chat if this hiccups
     }
 
-    // 3) Persist the inbound user message only if memory is enabled
+    // 3) Persist inbound user message only if memory is enabled
     if (persist) {
       try {
         await db.insert(schema.chatMessages).values({
