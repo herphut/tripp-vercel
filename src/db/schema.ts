@@ -22,10 +22,6 @@ export const userPrefs = tripp.table(
     userId: text("user_id").primaryKey(),
     memoryOptIn: boolean("memory_opt_in").notNull().default(false),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-
-    // optional provenance (who/what set the preference last)
-    updatedBy: varchar("updated_by", { length: 64 }), // e.g., "user", "admin", "system"
-    source: varchar("source", { length: 64 }),        // e.g., "ui", "api", "migration"
   }
 );
 
