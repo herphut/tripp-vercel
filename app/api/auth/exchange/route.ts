@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-export const runtime = "nodejs"; // ensure Node for 'crypto'
+export const runtime = "nodejs";
 
 import crypto from "crypto";
 import { db } from "@/src/db";
@@ -10,7 +10,7 @@ import { eq, and, desc, sql } from "drizzle-orm";
 type UUID = `${string}-${string}-${string}-${string}-${string}`;
 
 const MAX_SESS = Number(process.env.TRIPP_MAX_SESSIONS_PER_USER || 5);
-const TTL_MIN  = Number(process.env.TRIPP_SESSION_TTL_MIN || 1440); // 24h
+const TTL_MIN  = Number(process.env.TRIPP_SESSION_TTL_MIN || 1440);
 
 function subnet24(ip?: string) {
   if (!ip) return "0.0.0";
@@ -20,19 +20,39 @@ function subnet24(ip?: string) {
 function sha256(s: string) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
+function getCookieFromHeader(header: string | null, name: string): string | null {
+  if (!header) return null;
+  for (const part of header.split(/;\s*/)) {
+    const eq = part.indexOf("=");
+    if (eq > 0 && part.slice(0, eq) === name) return part.slice(eq + 1);
+  }
+  return null;
+}
 
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
   try {
-    const idToken = req.cookies.get("HH_ID_TOKEN")?.value;
+    // Primary: Next parser
+    let idToken = req.cookies.get("HH_ID_TOKEN")?.value ?? null;
+
+    // Fallback: raw Cookie header (guards against runtime/middleware quirks)
+    if (!idToken) {
+      idToken = getCookieFromHeader(req.headers.get("cookie"), "HH_ID_TOKEN");
+    }
+
     if (!idToken) {
       return NextResponse.json(
-        { error: "missing_id_token" },
+        {
+          error: "missing_id_token",
+          host: req.headers.get("host") || null,
+          has_any_cookie: Boolean(req.headers.get("cookie")),
+          note: "Cookie header did not include HH_ID_TOKEN",
+        },
         { status: 401, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Ensure verifyJwtRS256 enforces iss="https://herphut.com", aud="tripp", clockTolerance ~60s
+    // Verify JWT (make sure verifyJwtRS256 enforces iss/aud and clockTolerance)
     const { header, payload } = await verifyJwtRS256(idToken);
 
     const userId = String(payload.sub || "");
@@ -43,7 +63,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Device fingerprint (UA + /24 IP)
+    // Device fingerprint
     const ua = req.headers.get("user-agent") || "";
     const ip = (req.headers.get("x-forwarded-for") || "").split(",")[0]?.trim() || "";
     const ip24   = subnet24(ip.replace("::ffff:", ""));
@@ -53,33 +73,28 @@ export async function POST(req: NextRequest) {
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + TTL_MIN * 60_000);
-
-    // Generate a new session id (assert to UUID type)
     let sessionId: UUID = crypto.randomUUID() as UUID;
 
-    // Try to reuse existing
+    // Reuse if exists
     const existing = await db
       .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
       .from(chatSessions)
-      .where(
-        and(
-          eq(chatSessions.userId, userId),
-          eq(chatSessions.deviceHash, deviceHash),
-          sql`revoked_at IS NULL`
-        )
-      )
+      .where(and(
+        eq(chatSessions.userId, userId),
+        eq(chatSessions.deviceHash, deviceHash),
+        sql`revoked_at IS NULL`
+      ))
       .orderBy(desc(chatSessions.createdAt))
       .limit(1);
 
     if (existing.length) {
-      sessionId = existing[0].sessionId as UUID; // keep TS happy
-      await db
-        .update(chatSessions)
+      sessionId = existing[0].sessionId as UUID;
+      await db.update(chatSessions)
         .set({
           lastSeen: now,
-          expiresAt,
           updatedAt: now,
-          tier: (payload.tier as string) || "free", // sync tier on reuse
+          expiresAt,
+          tier: (payload.tier as string) || "free",
         })
         .where(eq(chatSessions.id, existing[0].id));
     } else {
@@ -100,7 +115,7 @@ export async function POST(req: NextRequest) {
         aud: (payload.aud as string) || null,
       });
 
-      // Cap sessions (confirm schema/table name)
+      // Cap sessions
       await db.execute(sql`
         WITH active AS (
           SELECT id FROM tripp.chat_sessions
@@ -113,7 +128,6 @@ export async function POST(req: NextRequest) {
       `);
     }
 
-    // Set our session cookie + return
     const res = NextResponse.json(
       { session_id: sessionId, user_id: userId, expires_at: expiresAt.toISOString() },
       { headers: { "Cache-Control": "no-store" } }
@@ -127,7 +141,6 @@ export async function POST(req: NextRequest) {
       expires: expiresAt,
     });
 
-    // Audit log (best-effort)
     try {
       await db.insert(auditLogs).values({
         createdAt: new Date(),
@@ -143,7 +156,6 @@ export async function POST(req: NextRequest) {
 
     return res;
   } catch (err: any) {
-    // Audit the failure (best-effort)
     try {
       await db.insert(auditLogs).values({
         createdAt: new Date(),
@@ -157,7 +169,7 @@ export async function POST(req: NextRequest) {
       });
     } catch {}
 
-    const refresh = `https://herphut.com/sso/refresh?return=${encodeURIComponent("https://tripp.herphut.com/")}`;
+    const refresh = `https://herphut.com/wp-json/herphut-sso/v1/refresh?return=${encodeURIComponent("https://tripp.herphut.com/")}`;
     return NextResponse.json(
       { error: "jwt_invalid", reason: String(err?.message || err), refresh },
       { status: 401, headers: { "Cache-Control": "no-store" } }

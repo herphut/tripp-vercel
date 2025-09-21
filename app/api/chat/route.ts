@@ -19,7 +19,7 @@ function haveKey(name: string) {
 
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
-  const { client_id, user_id } = await getIdentity(req); // if tier not provided, downstream defaults to "free"
+  const { client_id, user_id } = await getIdentity(req);
 
   try {
     const body = (await req.json()) as Body;
@@ -51,29 +51,20 @@ export async function POST(req: NextRequest) {
     }
 
     // 1) Decide if this session should persist messages (consent-aware)
-    const persist = await shouldPersist(req); // source of truth (user.memoryOptIn or session.memoryOptIn)
+    const persist = await shouldPersist(req);
 
-    // 2) Ensure there is a chat_sessions row (for rate limits, analytics, audit) and snapshot consent
-    //    We mirror the current consent into chat_sessions.memory_opt_in every request.
+    // 2) Ensure there is a chat_sessions row (insert-or-ignore)
     try {
-      // insert-or-ignore, then update a few columns (keep it idempotent)
       await db
         .insert(schema.chatSessions)
         .values({
           sessionId: body.session_id,
           clientId: client_id ?? "anon",
           userId: user_id ?? null,
-          memoryOptIn: persist,
         })
         .onConflictDoNothing();
-
-      // keep snapshot fresh if row already existed
-      await db
-        .update(schema.chatSessions)
-        .set({ memoryOptIn: persist, updatedAt: new Date() })
-        .where(eq(schema.chatSessions.sessionId, body.session_id));
     } catch {
-      // never throw from analytics path
+      // best-effort; don't fail chat if this hiccups
     }
 
     // 3) Persist the inbound user message only if memory is enabled
@@ -131,12 +122,8 @@ export async function POST(req: NextRequest) {
     // 5) Call OpenAI
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    // TODO: import your real, locked-down system prompt
-    // import { TRIPP_PROMPT } from "../../trippPrompt";
-    const system = TRIPP_PROMPT;
-
     const resp = await openai.responses.create({
-      model: "gpt-4.1-mini", // keep as-is; swap when you’re ready
+      model: "gpt-4.1-mini",
       input: [
         { role: "system", content: system },
         { role: "user", content: last.content },
