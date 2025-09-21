@@ -98,22 +98,44 @@ export async function POST(req: NextRequest) {
         })
         .where(eq(chatSessions.id, existing[0].id));
     } else {
-      await db.insert(chatSessions).values({
-        sessionId: sessionId as UUID,
-        clientId: null,
-        userId,
-        tier: (payload.tier as string) || "free",
-        createdAt: now,
-        expiresAt,
-        lastSeen: now,
-        deviceHash,
-        uaHash,
-        ipHash,
-        jti: (payload.jti as string) || null,
-        kid: header.kid || null,
-        iss: (payload.iss as string) || null,
-        aud: (payload.aud as string) || null,
-      });
+      try {
+  await db.insert(chatSessions)
+    .values({
+      sessionId,
+      clientId: null,
+      userId,
+      tier: (payload.tier as string) || "free",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt,
+      lastSeen: now,
+      revokedAt: null,
+      deviceHash,
+      uaHash,
+      ipHash,
+      jti: (payload.jti as string) || null,
+      kid: header.kid || null,
+      iss: (payload.iss as string) || null,
+      aud: (payload.aud as string) || null,
+    })
+    // Use the unique that actually exists in your DB:
+    .onConflictDoUpdate({
+      target: chatSessions.sessionId, // or [chatSessions.userId, chatSessions.deviceHash]
+      set: { updatedAt: now, lastSeen: now, expiresAt, tier: (payload.tier as string) || "free" },
+    });
+} catch (e: any) {
+  const reason = [
+    e?.code && `code=${e.code}`,               // 23505 unique_violation, 23502 not_null_violation, etc.
+    e?.constraint && `constraint=${e.constraint}`,
+    e?.detail && `detail=${e.detail}`,
+    e?.message && `message=${e.message}`,
+  ].filter(Boolean).join("; ");
+  return NextResponse.json(
+    { error: "db_error", reason },
+    { status: 500, headers: { "Cache-Control": "no-store" } }
+  );
+}
+
 
       // Cap sessions
       await db.execute(sql`
