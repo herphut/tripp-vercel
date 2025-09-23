@@ -2,9 +2,9 @@
 "use client";
 
 import * as React from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import MemoryToggle from "@/components/settings/MemoryToggle";
-import { getMemoryPref } from "@/src/lib/session"; // <- new helper you added
+import { getMemoryPref } from "@/src/lib/session"; // your helper returning boolean
 
 type Session = {
   id: string;
@@ -24,6 +24,28 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
   const [optedIn, setOptedIn] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
+  const fetchSessions = useCallback(async () => {
+    if (!optedIn) {
+      setSessions([]);
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await fetch("/api/session?list=1", {
+        cache: "no-store",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      });
+      const json = await res.json();
+      const arr: unknown = Array.isArray(json) ? json : (json?.sessions as unknown);
+      setSessions(Array.isArray(arr) ? (arr as Session[]) : []);
+    } catch {
+      setSessions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [optedIn]);
+
   // Fetch server-truth for memory on mount
   useEffect(() => {
     let cancelled = false;
@@ -34,20 +56,25 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
         localStorage.setItem("tripp:memoryOptIn", String(on));
       }
     })();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
-  // React immediately when the toggle changes (custom event) and cross-tab LS updates
+  // React when the toggle changes (custom event) and cross-tab LS updates
   useEffect(() => {
     function onChanged(ev: Event) {
       const next = (ev as CustomEvent<boolean>).detail;
       setOptedIn(!!next);
       localStorage.setItem("tripp:memoryOptIn", String(!!next));
+      if (next) void fetchSessions(); // refresh immediately when turning ON
+      else setSessions([]);
     }
     function onStorage(ev: StorageEvent) {
-      if (ev.key === "tripp:memoryOptIn") setOptedIn(ev.newValue === "true");
+      if (ev.key === "tripp:memoryOptIn") {
+        const next = ev.newValue === "true";
+        setOptedIn(next);
+        if (next) void fetchSessions();
+        else setSessions([]);
+      }
     }
     window.addEventListener("tripp:memoryChanged", onChanged as EventListener);
     window.addEventListener("storage", onStorage);
@@ -55,49 +82,19 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
       window.removeEventListener("tripp:memoryChanged", onChanged as EventListener);
       window.removeEventListener("storage", onStorage);
     };
-  }, []);
+  }, [fetchSessions]);
 
-  // Load recent sessions only when opted-in
-  useEffect(() => {
-    if (!optedIn) {
-      setSessions([]);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      setLoading(true);
-      try {
-        const res = await fetch("/api/session?list=1", {
-          cache: "no-store",
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        });
-        const json = await res.json();
-        const arr: unknown = Array.isArray(json) ? json : (json?.sessions as unknown);
-        if (!cancelled) setSessions(Array.isArray(arr) ? (arr as Session[]) : []);
-      } catch {
-        if (!cancelled) setSessions([]);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [optedIn]);
+  // Load sessions whenever optedIn flips true
+  useEffect(() => { if (optedIn) void fetchSessions(); }, [optedIn, fetchSessions]);
 
-  function select(id: string) {
-    // Fire DOM event; page can listen and react (no function props)
-    window.dispatchEvent(new CustomEvent("tripp:selectSession", { detail: id }));
+  // Also refresh after closing settings (handy right after saving)
+  function closeSettings() {
+    setShowSettings(false);
+    if (optedIn) void fetchSessions();
   }
 
-  async function clearSessionHistory() {
-    if (!confirm("Clear this session's chat history?")) return;
-    await fetch("/api/preferences/clear", {
-      method: "POST",
-      credentials: "include",
-    }).catch(() => {});
-    window.dispatchEvent(new CustomEvent("tripp:clearedSession"));
+  function select(id: string) {
+    window.dispatchEvent(new CustomEvent("tripp:selectSession", { detail: id }));
   }
 
   return (
@@ -142,7 +139,7 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
                   <li key={s.id}>
                     <button
                       onClick={() => select(s.id)}
-                      className="w-full text-left px-3 py-2 rounded-md bg-[#1f2328] border border-[#30363d] hover:bg[#242a31] transition"
+                      className="w-full text-left px-3 py-2 rounded-md bg-[#1f2328] border border-[#30363d] hover:bg-[#242a31] transition"
                     >
                       <div className="text-sm">
                         {s.title ?? `Chat ${s.id.slice(0, 8)}`}
@@ -165,7 +162,7 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
           role="dialog"
           aria-modal="true"
           className="fixed inset-0 bg-black/50 grid place-items-center z-50"
-          onClick={() => setShowSettings(false)}
+          onClick={closeSettings}
         >
           <div
             onClick={(e) => e.stopPropagation()}
@@ -173,7 +170,7 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
           >
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-lg font-semibold m-0">Settings</h3>
-              <button onClick={() => setShowSettings(false)} className="opacity-70 hover:opacity-100">✖</button>
+              <button onClick={closeSettings} className="opacity-70 hover:opacity-100">✖</button>
             </div>
 
             <div className="space-y-4">
@@ -183,15 +180,6 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
                   Turn on to let Tripp remember your conversations. You can turn this off anytime.
                 </div>
                 <MemoryToggle />
-              </div>
-
-              <div className="flex justify-end">
-                <button
-                  onClick={clearSessionHistory}
-                  className="text-sm px-3 py-2 rounded border border-zinc-700 hover:bg-zinc-800"
-                >
-                  Clear this session’s history
-                </button>
               </div>
             </div>
           </div>

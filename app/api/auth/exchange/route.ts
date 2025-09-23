@@ -12,6 +12,7 @@ type UUID = `${string}-${string}-${string}-${string}-${string}`;
 
 const MAX_SESS = Number(process.env.TRIPP_MAX_SESSIONS_PER_USER || 5);
 const TTL_MIN  = Number(process.env.TRIPP_SESSION_TTL_MIN || 1440); // minutes (default 24h)
+const CLIENT_ID = "webchat"; // normalized and consistent
 
 function subnet24(ip?: string) {
   if (!ip) return "0.0.0";
@@ -38,6 +39,19 @@ export async function POST(req: NextRequest) {
   if (!idToken) idToken = getCookieFromHeader(req.headers.get("cookie"), "HH_ID_TOKEN");
 
   if (!idToken) {
+    // audit the 401 as well
+    try {
+      await db.insert(auditLogs).values({
+        createdAt: new Date(),
+        route: "/auth/exchange",
+        status: 401,
+        clientId: CLIENT_ID,
+        userId: null,
+        sessionId: null,
+        latencyMs: Date.now() - t0,
+        error: "missing_id_token",
+      });
+    } catch {}
     return NextResponse.json(
       {
         error: "missing_id_token",
@@ -60,7 +74,7 @@ export async function POST(req: NextRequest) {
         createdAt: new Date(),
         route: "/auth/exchange",
         status: 401,
-        clientId: "Webchat",
+        clientId: CLIENT_ID,
         userId: null,
         sessionId: null,
         latencyMs: Date.now() - t0,
@@ -78,6 +92,18 @@ export async function POST(req: NextRequest) {
 
   const userId = String(payload.sub || "");
   if (!userId) {
+    try {
+      await db.insert(auditLogs).values({
+        createdAt: new Date(),
+        route: "/auth/exchange",
+        status: 401,
+        clientId: CLIENT_ID,
+        userId: null,
+        sessionId: null,
+        latencyMs: Date.now() - t0,
+        error: "sub_missing",
+      });
+    } catch {}
     return NextResponse.json(
       { error: "sub_missing" },
       { status: 401, headers: { "Cache-Control": "no-store" } }
@@ -92,9 +118,6 @@ export async function POST(req: NextRequest) {
   const ipHash = sha256(ip24);
   const deviceHash = sha256(`${uaHash}:${ipHash}`);
 
-  // short + explicit, DB requires NOT NULL and <=64 chars
-  const clientId = "Webchat";
-
   const now = new Date();
   const expiresAt = new Date(now.getTime() + TTL_MIN * 60_000);
   let sessionId: UUID = crypto.randomUUID() as UUID;
@@ -104,7 +127,13 @@ export async function POST(req: NextRequest) {
     const existing = await db
       .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
       .from(chatSessions)
-      .where(and(eq(chatSessions.userId, userId), eq(chatSessions.deviceHash, deviceHash), sql`revoked_at IS NULL`))
+      .where(
+        and(
+          eq(chatSessions.userId, userId),
+          eq(chatSessions.deviceHash, deviceHash),
+          sql`revoked_at IS NULL`
+        )
+      )
       .orderBy(desc(chatSessions.createdAt))
       .limit(1);
 
@@ -117,7 +146,8 @@ export async function POST(req: NextRequest) {
           lastSeen: now,
           expiresAt,
           tier: (payload.tier as string) || "free",
-          clientId, // keep in sync
+          clientId: CLIENT_ID,
+          userId, // keep in sync on reuse
         })
         .where(eq(chatSessions.id, existing[0].id));
     } else {
@@ -126,7 +156,7 @@ export async function POST(req: NextRequest) {
         .insert(chatSessions)
         .values({
           sessionId,
-          clientId, // NOT NULL
+          clientId: CLIENT_ID,
           userId,
           tier: (payload.tier as string) || "free",
           createdAt: now,
@@ -143,14 +173,14 @@ export async function POST(req: NextRequest) {
           aud: (payload.aud as string) || null,
         })
         .onConflictDoUpdate({
-          // your schema shows UNIQUE(session_id)
-          target: chatSessions.sessionId,
+          target: chatSessions.sessionId, // UNIQUE(session_id)
           set: {
             updatedAt: now,
             lastSeen: now,
             expiresAt,
             tier: (payload.tier as string) || "free",
-            clientId,
+            clientId: CLIENT_ID,
+            userId, // <- backfill/ensure not null on conflict
           },
         });
 
@@ -181,13 +211,13 @@ export async function POST(req: NextRequest) {
       expires: expiresAt,
     });
 
-    // ---- 8) Audit success (best effort) ----
+    // ---- 8) Audit success (include IDs) ----
     try {
       await db.insert(auditLogs).values({
         createdAt: new Date(),
         route: "/auth/exchange",
         status: 200,
-        clientId,
+        clientId: CLIENT_ID,
         userId,
         sessionId,
         latencyMs: Date.now() - t0,
@@ -200,7 +230,7 @@ export async function POST(req: NextRequest) {
     // surface precise PG info so we can diagnose instantly
     const pg = e?.cause ?? e;
     const reason = [
-      pg?.code && `code=${pg.code}`,              // 23505 unique_violation, 23502 not_null_violation, 22P02 invalid_text_representation, etc.
+      pg?.code && `code=${pg.code}`,
       pg?.constraint && `constraint=${pg.constraint}`,
       pg?.column && `column=${pg.column}`,
       pg?.detail && `detail=${pg.detail}`,
@@ -214,7 +244,7 @@ export async function POST(req: NextRequest) {
         createdAt: new Date(),
         route: "/auth/exchange",
         status: 500,
-        clientId,
+        clientId: CLIENT_ID,
         userId,
         sessionId,
         latencyMs: Date.now() - t0,

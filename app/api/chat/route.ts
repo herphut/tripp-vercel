@@ -1,38 +1,42 @@
 // app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
 import { db, schema } from "@/db/db";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import OpenAI from "openai";
 import { TRIPP_PROMPT } from "@/app/api/_lib/trippPrompt";
-import { getIdentity } from "../_lib/persistence"; // keep your existing identity helper
+import { getIdentity } from "@/app/api/_lib/identity";
 import { auditLog } from "../_lib/audit";
 
-// ✅ NEW: DB-driven prefs + JWT verify
-import { readPrefs } from "@/src/lib/prefs";        // ensurePrefsRow/readPrefs as we created
-import { verifyJwtRS256 } from "@/lib/jwtVerify";   // your existing verifier
+// DB-driven prefs + JWT verify
+import { readPrefs } from "@/src/lib/prefs";
+import { verifyJwtRS256 } from "@/lib/jwtVerify";
 
 const system = TRIPP_PROMPT;
+const HISTORY_LIMIT = 30;
+
+function makeTitleFrom(text: string): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  const firstStop = cleaned.search(/[.!?]/);
+  const base = (firstStop > 15 ? cleaned.slice(0, firstStop + 1) : cleaned).slice(0, 60);
+  return base || "New chat";
+}
 
 type Msg = { role: "user" | "assistant" | "system"; content: string };
 type Body = { session_id: string; user_id?: string | null; messages: Msg[] };
 
-function haveKey(name: string) {
-  const v = process.env[name];
-  return !!v && v.trim() !== "";
-}
-
-// --- NEW: get user id from HH_ID_TOKEN (server-side) ---
+// --- user id from HH_ID_TOKEN (server-side) ---
 async function userIdFromToken(req: NextRequest): Promise<string | null> {
-  // cookie helper (raw fallback just in case)
-  const rawCookie = req.cookies.get("HH_ID_TOKEN")?.value
-    ?? (req.headers.get("cookie") || "")
+  const raw =
+    req.cookies.get("HH_ID_TOKEN")?.value ??
+    (req.headers.get("cookie") || "")
       .split("; ")
-      .find(s => s.startsWith("HH_ID_TOKEN="))
+      .find((s) => s.startsWith("HH_ID_TOKEN="))
       ?.split("=")[1];
 
-  if (!rawCookie) return null;
+  if (!raw) return null;
   try {
-    const { payload } = await verifyJwtRS256(rawCookie);
+    const { payload } = await verifyJwtRS256(raw);
     const uid = String(payload.sub || "");
     return uid || null;
   } catch {
@@ -40,86 +44,216 @@ async function userIdFromToken(req: NextRequest): Promise<string | null> {
   }
 }
 
-// --- NEW: single source of truth for memory persistence ---
+// --- single source of truth for memory persistence ---
 async function shouldPersist(req: NextRequest): Promise<boolean> {
   const uid = await userIdFromToken(req);
-  if (!uid) return false;         // no user → no memory
+  if (!uid) return false; // anon → no memory persistence
   try {
-    // readPrefs ensures row exists (defaults to false if missing)
-    return await readPrefs(uid);
+    return await readPrefs(uid); // boolean; defaults false if row missing
   } catch {
     return false;
   }
 }
 
+function haveKey(name: string) {
+  const v = process.env[name];
+  return !!v && v.trim() !== "";
+}
+
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
-  const { client_id, user_id } = await getIdentity(req); // keep your diagnostic identity
+  const { client_id, user_id: identityUserId } = await getIdentity(req);
+
+  // soft session id from client-visible cookies (anon or helper cookie)
+  const softSessionId =
+    req.cookies.get("SESSION_ID")?.value ||
+    req.cookies.get("ANON_SESSION_ID")?.value ||
+    null;
 
   try {
     const body = (await req.json()) as Body;
-    if (!body?.session_id || !Array.isArray(body.messages) || body.messages.length === 0) {
+
+    // prefer explicit session id from body; fall back to soft cookie identity
+    const sessionId = body?.session_id || softSessionId || crypto.randomUUID();
+
+    if (!Array.isArray(body?.messages) || body.messages.length === 0) {
       await auditLog({
         route: "/api/chat:POST",
         status: 400,
         client_id,
-        user_id,
+        user_id: identityUserId,
+        session_id: sessionId,
         latency_ms: Date.now() - t0,
         error: "bad_request",
       });
       return NextResponse.json({ error: "bad_request" }, { status: 400 });
     }
 
-    // last user turn
+    // last user turn (required)
     const last = [...body.messages].reverse().find((m) => m.role === "user");
     if (!last?.content) {
       await auditLog({
         route: "/api/chat:POST",
         status: 400,
         client_id,
-        user_id,
-        session_id: body.session_id,
+        user_id: identityUserId,
+        session_id: sessionId,
         latency_ms: Date.now() - t0,
         error: "messages_required",
       });
       return NextResponse.json({ error: "messages_required" }, { status: 400 });
     }
 
-    // 1) Decide if this session should persist messages (DB-driven)
+    // Decide persistence (consent-aware; anon => false)
     const persist = await shouldPersist(req);
 
-    // 2) Ensure there is a chat_sessions row (insert-or-ignore; minimal)
+    // Ensure a chat_sessions row exists (best-effort)
     try {
       await db
         .insert(schema.chatSessions)
         .values({
-          sessionId: body.session_id,
-          clientId: client_id ?? "anon",   // fine; your table has NOT NULL on client_id
-          userId: user_id ?? null,
+          sessionId,
+          clientId: client_id ?? "webchat",
+          userId: identityUserId ?? null,
         })
         .onConflictDoNothing();
-    } catch {
-      // best-effort; don't fail chat if this hiccups
-    }
+    } catch {}
 
-    // 3) Persist inbound user message only if memory is enabled
+    // If persisting, store the inbound user message (with user_id)
     if (persist) {
       try {
         await db.insert(schema.chatMessages).values({
-          sessionId: body.session_id,
+          sessionId,
+          userId: identityUserId ?? null,
           role: "user",
           content: last.content,
         });
-      } catch {
-        // don't fail the request if storage hiccups
-      }
+
+        // Title + first_user_at only once (first user turn)
+        await db
+          .update(schema.chatSessions)
+          .set({
+            firstUserAt: sql`COALESCE(${schema.chatSessions.firstUserAt}, NOW())`,
+            title: sql`COALESCE(${schema.chatSessions.title}, ${makeTitleFrom(last.content)})`,
+            updatedAt: new Date(),
+            lastSeen: new Date(),
+          })
+          .where(eq(schema.chatSessions.sessionId, sessionId));
+      } catch {}
     }
 
-    // 4) No key? Echo path for local/dev
-    if (!haveKey("OPENAI_API_KEY")) {
-      const reply = `Echo: ${last.content}`;
+    // Build model input
+    const modelMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
+      { role: "system", content: system },
+    ];
 
-      const messages = persist
+    if (persist) {
+      // Use DB transcript (already includes just-inserted user turn)
+      const history = await db
+        .select({
+          role: schema.chatMessages.role,
+          content: schema.chatMessages.content,
+          created_at: schema.chatMessages.createdAt,
+        })
+        .from(schema.chatMessages)
+        .where(eq(schema.chatMessages.sessionId, sessionId))
+        .orderBy(asc(schema.chatMessages.createdAt));
+
+      const trimmed = history
+        .slice(-HISTORY_LIMIT)
+        .map((h) => ({ role: h.role as "user" | "assistant", content: h.content ?? "" }));
+
+      modelMessages.push(...trimmed);
+    } else {
+      // Anon or memory off → use client-provided rolling window
+      const rolling = body.messages
+        .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .slice(-HISTORY_LIMIT)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      modelMessages.push(...rolling);
+
+      // Ensure the latest user turn is last
+      const needLast =
+        rolling.length === 0 ||
+        rolling[rolling.length - 1].role !== "user" ||
+        rolling[rolling.length - 1].content !== last.content;
+      if (needLast) modelMessages.push({ role: "user", content: last.content });
+    }
+
+    // Local/dev echo path
+    if (!haveKey("OPENAI_API_KEY")) {
+      const assistantText = `Echo: ${last.content}`;
+
+      const messagesOut =
+        persist
+          ? await db
+              .select({
+                role: schema.chatMessages.role,
+                content: schema.chatMessages.content,
+                created_at: schema.chatMessages.createdAt,
+              })
+              .from(schema.chatMessages)
+              .where(eq(schema.chatMessages.sessionId, sessionId))
+              .orderBy(asc(schema.chatMessages.createdAt))
+          : [
+              ...modelMessages
+                .filter((m) => m.role !== "system")
+                .map((m) => ({
+                  role: m.role,
+                  content: m.content,
+                  created_at: new Date().toISOString(),
+                })),
+              { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
+            ];
+
+      await auditLog({
+        route: "/api/chat:POST",
+        status: 200,
+        client_id,
+        user_id: identityUserId,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+      });
+
+      return NextResponse.json({
+        messages: messagesOut,
+        diag: { openai_used: false, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
+      });
+    }
+
+    // Call OpenAI with history-aware input
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    const resp = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: modelMessages,
+    });
+    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+
+    // Persist assistant only if memory is enabled
+    if (persist) {
+      try {
+        await db.insert(schema.chatMessages).values({
+          sessionId,
+          userId: identityUserId ?? null,
+          role: "assistant",
+          content: assistantText,
+        });
+
+        // keep session timestamps fresh
+        await db
+          .update(schema.chatSessions)
+          .set({
+            updatedAt: new Date(),
+            lastSeen: new Date(),
+          })
+          .where(eq(schema.chatSessions.sessionId, sessionId));
+      } catch {}
+    }
+
+    // Build the response transcript
+    const messages =
+      persist
         ? await db
             .select({
               role: schema.chatMessages.role,
@@ -127,98 +261,39 @@ export async function POST(req: NextRequest) {
               created_at: schema.chatMessages.createdAt,
             })
             .from(schema.chatMessages)
-            .where(eq(schema.chatMessages.sessionId, body.session_id))
+            .where(eq(schema.chatMessages.sessionId, sessionId))
             .orderBy(asc(schema.chatMessages.createdAt))
         : [
-            { role: "user", content: last.content, created_at: new Date().toISOString() },
-            { role: "assistant", content: reply, created_at: new Date().toISOString() },
+            ...modelMessages
+              .filter((m) => m.role !== "system")
+              .map((m) => ({
+                role: m.role,
+                content: m.content,
+                created_at: new Date().toISOString(),
+              })),
+            { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
           ];
-
-      await auditLog({
-        route: "/api/chat:POST",
-        status: 200,
-        client_id,
-        user_id,
-        session_id: body.session_id,
-        latency_ms: Date.now() - t0,
-      });
-
-      return NextResponse.json({
-        messages,
-        diag: {
-          openai_used: false,
-          persisted: persist,
-          reason: "missing OPENAI_API_KEY",
-          memory_scope: user_id ? "user" : "session",
-        },
-      });
-    }
-
-    // 5) Call OpenAI
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-
-    const resp = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: last.content },
-      ],
-    });
-
-    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
-
-    // 6) Persist assistant turn only if memory is enabled
-    if (persist) {
-      try {
-        await db.insert(schema.chatMessages).values({
-          sessionId: body.session_id,
-          role: "assistant",
-          content: assistantText,
-        });
-      } catch {
-        // swallow storage issues
-      }
-    }
-
-    // 7) Build response transcript
-    const messages = persist
-      ? await db
-          .select({
-            role: schema.chatMessages.role,
-            content: schema.chatMessages.content,
-            created_at: schema.chatMessages.createdAt,
-          })
-          .from(schema.chatMessages)
-          .where(eq(schema.chatMessages.sessionId, body.session_id))
-          .orderBy(asc(schema.chatMessages.createdAt))
-      : [
-          { role: "user", content: last.content, created_at: new Date().toISOString() },
-          { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
-        ];
 
     await auditLog({
       route: "/api/chat:POST",
       status: 200,
       client_id,
-      user_id,
-      session_id: body.session_id,
+      user_id: identityUserId,
+      session_id: sessionId,
       latency_ms: Date.now() - t0,
     });
 
     return NextResponse.json({
       messages,
-      diag: {
-        openai_used: true,
-        persisted: persist,
-        memory_scope: user_id ? "user" : "session",
-      },
+      diag: { openai_used: true, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
     });
   } catch (e: any) {
     await auditLog({
       route: "/api/chat:POST",
       status: 500,
       client_id,
-      user_id,
+      user_id: identityUserId,
+      session_id: null,
       latency_ms: Date.now() - t0,
       error: String(e?.message ?? e),
     });
