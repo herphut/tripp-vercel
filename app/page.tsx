@@ -3,9 +3,18 @@
 import type { FormEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import Sidebar from '../components/Sidebar';
-import { getMemoryPref } from '@/src/lib/session'; // <-- uses /api/prefs
+import { getMemoryPref } from '@/src/lib/session'; // uses /api/prefs
 
 type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
+
+const LOCAL_HISTORY_LIMIT = 30;
+function buildRollingWindow(
+  local: { role: 'user' | 'assistant'; content: string }[],
+  newestUser: string
+) {
+  const combined = [...local, { role: 'user' as const, content: newestUser }];
+  return combined.slice(-LOCAL_HISTORY_LIMIT);
+}
 
 // ---------- tiny auth boot helpers ----------
 type ExchangeOK = { session_id: string; user_id: string; expires_at: string };
@@ -24,7 +33,6 @@ async function exchange(): Promise<ExchangeOK> {
   if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
   return r.json();
 }
-// --------------------------------------------
 
 function NewChatLink({ onClick, visible }: { onClick: () => void; visible: boolean }) {
   if (!visible) return null;
@@ -60,18 +68,37 @@ export default function ChatPage() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
-  // Sidebar session select (unchanged)
+  // Load transcript when a session is selected in the sidebar
   useEffect(() => {
-    function onSelect(e: Event) {
+    async function onSelect(e: Event) {
       const id = (e as CustomEvent<string>).detail;
-      console.log('selected session', id);
-      // optionally load that session's messages here
+      setSessionId(id);
+
+      try {
+        const r = await fetch(`/api/history?session_id=${encodeURIComponent(id)}`, {
+          credentials: 'include',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        });
+        const rows = await r.json();
+        if (Array.isArray(rows) && rows.length) {
+          const ms = rows.map((m: any) => ({
+            role: (m.role === 'system' ? 'assistant' : m.role) as 'user' | 'assistant',
+            content: String(m.content ?? ''),
+          })) as LocalChatMessage[];
+          setMessages(ms);
+        } else {
+          setMessages([{ role: 'assistant', content: 'Fresh slate for this chat. What’s on your mind?' }]);
+        }
+      } catch {
+        setMessages([{ role: 'assistant', content: 'Couldn’t load that chat. Try again in a bit.' }]);
+      }
     }
     window.addEventListener('tripp:selectSession', onSelect as EventListener);
     return () => window.removeEventListener('tripp:selectSession', onSelect as EventListener);
   }, []);
 
-  // Reflect memory toggle changes from Settings (and cross-tab via localStorage)
+  // Reflect memory toggle changes (and cross-tab via localStorage)
   useEffect(() => {
     function onChanged(ev: Event) {
       const next = (ev as CustomEvent<boolean>).detail;
@@ -98,7 +125,7 @@ export default function ChatPage() {
         setSessionId(x.session_id);
         setUserId(x.user_id);
 
-        const on = await getMemoryPref(); // <-- now uses /api/prefs
+        const on = await getMemoryPref();
         if (cancelled) return;
         setMemoryEnabled(on);
         localStorage.setItem('tripp:memoryOptIn', String(on));
@@ -108,12 +135,16 @@ export default function ChatPage() {
         setReady(true);
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
   // -------------------------------------------------
 
   function handleNewChat() {
     setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
+    // keep same sessionId; server will continue that session
+    // (If you want a brand new session cookie/row, we can add an endpoint later)
   }
 
   async function onSubmit(e: FormEvent) {
@@ -131,16 +162,30 @@ export default function ChatPage() {
     setSending(true);
 
     try {
+      // Build payload depending on memory setting
+      const payload =
+        memoryEnabled
+          // Memory ON → server pulls full history from DB
+          ? {
+              session_id: sessionId,
+              user_id: userId,
+              messages: [{ role: 'user', content: text }],
+            }
+          // Memory OFF (or anon) → send our rolling local history
+          : {
+              session_id: sessionId,
+              user_id: userId,
+              messages: buildRollingWindow(
+                messages.map((m) => ({ role: m.role, content: m.content })), // local transcript
+                text
+              ),
+            };
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         credentials: 'include', // ensure cookies go with the request
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          session_id: sessionId,
-          user_id: userId,
-          messages: [{ role: 'user', content: text }], // server only needs latest turn
-          memoryEnabled, // server decides whether to persist
-        }),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
 
@@ -148,12 +193,18 @@ export default function ChatPage() {
       const data = await res.json();
       const serverMsgs =
         Array.isArray(data?.messages)
-          ? data.messages.map((m: any) => ({ role: m.role as 'user' | 'assistant', content: String(m.content ?? '') }))
+          ? data.messages.map((m: any) => ({
+              role: m.role as 'user' | 'assistant',
+              content: String(m.content ?? ''),
+            }))
           : [{ role: 'assistant', content: String(data?.reply ?? data?.text ?? '') }];
 
       setMessages(serverMsgs);
     } catch {
-      setMessages((m) => [...m, { role: 'assistant', content: 'Sorry—out basking for a sec. Try again in a bit. 🦎' }]);
+      setMessages((m) => [
+        ...m,
+        { role: 'assistant', content: 'Sorry—out basking for a sec. Try again in a bit. 🦎' },
+      ]);
     } finally {
       setSending(false);
     }
@@ -166,9 +217,7 @@ export default function ChatPage() {
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
       {/* LEFT: Sidebar — place NewChatLink just above recent chats */}
-      <Sidebar
-        headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
-      />
+      <Sidebar headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />} />
 
       {/* RIGHT: Chat UI */}
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
