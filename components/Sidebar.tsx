@@ -4,13 +4,28 @@
 import * as React from "react";
 import { useEffect, useState, useCallback } from "react";
 import MemoryToggle from "@/components/settings/MemoryToggle";
-import { getMemoryPref } from "@/src/lib/session"; // your helper returning boolean
+import { getMemoryPref } from "@/src/lib/session"; // returns boolean
+
+function formatDate(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 
 type Session = {
-  id: string;
-  title: string | null;
-  created_at: string;
-  updated_at: string | null;
+  id: string;                 // sessionId
+  title: string | null;       // session title (nullable)
+  created_at: string;         // ISO
+  first_user_at?: string | null; // ISO, nullable
+  updated_at: string | null;  // ISO
+  last_seen?: string | null;  // ISO, optional
 };
 
 type SidebarProps = {
@@ -54,10 +69,11 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
       if (!cancelled) {
         setOptedIn(on);
         localStorage.setItem("tripp:memoryOptIn", String(on));
+        if (on) void fetchSessions();
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [fetchSessions]);
 
   // React when the toggle changes (custom event) and cross-tab LS updates
   useEffect(() => {
@@ -65,15 +81,13 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
       const next = (ev as CustomEvent<boolean>).detail;
       setOptedIn(!!next);
       localStorage.setItem("tripp:memoryOptIn", String(!!next));
-      if (next) void fetchSessions(); // refresh immediately when turning ON
-      else setSessions([]);
+      if (next) void fetchSessions(); else setSessions([]);
     }
     function onStorage(ev: StorageEvent) {
       if (ev.key === "tripp:memoryOptIn") {
         const next = ev.newValue === "true";
         setOptedIn(next);
-        if (next) void fetchSessions();
-        else setSessions([]);
+        if (next) void fetchSessions(); else setSessions([]);
       }
     }
     window.addEventListener("tripp:memoryChanged", onChanged as EventListener);
@@ -96,6 +110,12 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
   function select(id: string) {
     window.dispatchEvent(new CustomEvent("tripp:selectSession", { detail: id }));
   }
+
+  // small util: prefer first_user_at > created_at for the subtitle
+  function subtitleFor(s: Session) {
+  const when = s.first_user_at ?? s.created_at ?? s.updated_at;
+  return formatDate(when);
+}
 
   return (
     <aside className="w-72 shrink-0 border-r border-zinc-800 h-screen overflow-y-auto text-white">
@@ -145,7 +165,7 @@ export default function Sidebar({ headerExtra }: SidebarProps) {
                         {s.title ?? `Chat ${s.id.slice(0, 8)}`}
                       </div>
                       <div className="text-xs opacity-70">
-                        {s.updated_at ?? s.created_at}
+                        {subtitleFor(s)}
                       </div>
                     </button>
                   </li>

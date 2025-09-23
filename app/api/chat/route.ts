@@ -1,5 +1,7 @@
 // app/api/chat/route.ts
 import { NextRequest, NextResponse } from "next/server";
+export const runtime = "nodejs";
+
 import crypto from "crypto";
 import { db, schema } from "@/db/db";
 import { asc, eq, sql } from "drizzle-orm";
@@ -23,7 +25,7 @@ function makeTitleFrom(text: string): string {
 }
 
 type Msg = { role: "user" | "assistant" | "system"; content: string };
-type Body = { session_id: string; user_id?: string | null; messages: Msg[] };
+type Body = { session_id: string; user_id?: string | null; messages: Msg[]; image_url?: string };
 
 // --- user id from HH_ID_TOKEN (server-side) ---
 async function userIdFromToken(req: NextRequest): Promise<string | null> {
@@ -63,6 +65,7 @@ function haveKey(name: string) {
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
   const { client_id, user_id: identityUserId } = await getIdentity(req);
+  const clientId = client_id ?? "webchat";
 
   // soft session id from client-visible cookies (anon or helper cookie)
   const softSessionId =
@@ -80,13 +83,16 @@ export async function POST(req: NextRequest) {
       await auditLog({
         route: "/api/chat:POST",
         status: 400,
-        client_id,
+        client_id: clientId,
         user_id: identityUserId,
         session_id: sessionId,
         latency_ms: Date.now() - t0,
         error: "bad_request",
       });
-      return NextResponse.json({ error: "bad_request" }, { status: 400 });
+      return NextResponse.json(
+        { error: "bad_request" },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
     }
 
     // last user turn (required)
@@ -95,13 +101,16 @@ export async function POST(req: NextRequest) {
       await auditLog({
         route: "/api/chat:POST",
         status: 400,
-        client_id,
+        client_id: clientId,
         user_id: identityUserId,
         session_id: sessionId,
         latency_ms: Date.now() - t0,
         error: "messages_required",
       });
-      return NextResponse.json({ error: "messages_required" }, { status: 400 });
+      return NextResponse.json(
+        { error: "messages_required" },
+        { status: 400, headers: { "Cache-Control": "no-store" } }
+      );
     }
 
     // Decide persistence (consent-aware; anon => false)
@@ -113,13 +122,13 @@ export async function POST(req: NextRequest) {
         .insert(schema.chatSessions)
         .values({
           sessionId,
-          clientId: client_id ?? "webchat",
+          clientId,
           userId: identityUserId ?? null,
         })
         .onConflictDoNothing();
     } catch {}
 
-    // If persisting, store the inbound user message (with user_id)
+    // If persisting, store the inbound user message (with user_id) + set title/first_user_at once
     if (persist) {
       try {
         await db.insert(schema.chatMessages).values({
@@ -129,7 +138,6 @@ export async function POST(req: NextRequest) {
           content: last.content,
         });
 
-        // Title + first_user_at only once (first user turn)
         await db
           .update(schema.chatSessions)
           .set({
@@ -143,7 +151,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Build model input
-    const modelMessages: { role: "system" | "user" | "assistant"; content: string }[] = [
+    const modelMessages: { role: "system" | "user" | "assistant"; content: any }[] = [
       { role: "system", content: system },
     ];
 
@@ -171,7 +179,7 @@ export async function POST(req: NextRequest) {
         .slice(-HISTORY_LIMIT)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      modelMessages.push(...rolling);
+      modelMessages.push(...(rolling as any));
 
       // Ensure the latest user turn is last
       const needLast =
@@ -181,9 +189,14 @@ export async function POST(req: NextRequest) {
       if (needLast) modelMessages.push({ role: "user", content: last.content });
     }
 
-    // Local/dev echo path
+    // Echo path (helpful in local/dev)
+    const maybeAttachedImageForEcho =
+      (typeof body?.image_url === "string" && body.image_url) || null;
+
     if (!haveKey("OPENAI_API_KEY")) {
-      const assistantText = `Echo: ${last.content}`;
+      const assistantText =
+        `Echo: ${last.content}` +
+        (maybeAttachedImageForEcho ? `\n\n(Attached image: ${maybeAttachedImageForEcho})` : "");
 
       const messagesOut =
         persist
@@ -210,25 +223,61 @@ export async function POST(req: NextRequest) {
       await auditLog({
         route: "/api/chat:POST",
         status: 200,
-        client_id,
+        client_id: clientId,
         user_id: identityUserId,
         session_id: sessionId,
         latency_ms: Date.now() - t0,
       });
 
-      return NextResponse.json({
-        messages: messagesOut,
-        diag: { openai_used: false, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
+      return NextResponse.json(
+        {
+          messages: messagesOut,
+          diag: { openai_used: false, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
+        },
+        { headers: { "Cache-Control": "no-store" } }
+      );
+    }
+
+    // --- If an image was attached, append a multimodal user turn ---
+    const imageUrl = body?.image_url;
+    if (imageUrl) {
+      const visionPrompt =
+        (typeof last?.content === "string" && last.content.trim()) ||
+        "Please describe this image and note anything important.";
+
+      (modelMessages as any[]).push({
+        role: "user",
+        content: [
+          { type: "input_text", text: visionPrompt },
+          { type: "input_image", image_url: imageUrl },
+        ],
       });
     }
 
-    // Call OpenAI with history-aware input
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const resp = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: modelMessages,
-    });
-    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+    // Call OpenAI (use a vision-capable model when an image is present)
+    let assistantText = "Sorry, I came up empty.";
+    try {
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+      const resp = await openai.responses.create({
+        model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
+        input: modelMessages as any, // mixed text + multimodal is OK for Responses API
+      });
+      assistantText = resp.output_text?.trim() || assistantText;
+    } catch (err: any) {
+      await auditLog({
+        route: "/api/chat:POST",
+        status: 502,
+        client_id: clientId,
+        user_id: identityUserId,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+        error: `openai_error: ${String(err?.message || err)}`,
+      });
+      return NextResponse.json(
+        { error: "openai_unavailable", message: "Model call failed. Try again shortly." },
+        { status: 502, headers: { "Cache-Control": "no-store" } }
+      );
+    }
 
     // Persist assistant only if memory is enabled
     if (persist) {
@@ -277,21 +326,24 @@ export async function POST(req: NextRequest) {
     await auditLog({
       route: "/api/chat:POST",
       status: 200,
-      client_id,
+      client_id: clientId,
       user_id: identityUserId,
       session_id: sessionId,
       latency_ms: Date.now() - t0,
     });
 
-    return NextResponse.json({
-      messages,
-      diag: { openai_used: true, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
-    });
+    return NextResponse.json(
+      {
+        messages,
+        diag: { openai_used: true, persisted: persist, memory_scope: identityUserId ? "user" : "session" },
+      },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (e: any) {
     await auditLog({
       route: "/api/chat:POST",
       status: 500,
-      client_id,
+      client_id: clientId,
       user_id: identityUserId,
       session_id: null,
       latency_ms: Date.now() - t0,
@@ -299,7 +351,8 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(
       { error: "chat_route_failed", detail: "internal_error" },
-      { status: 500, headers: { "content-type": "application/json" } }
+      { status: 500, headers: { "content-type": "application/json", "Cache-Control": "no-store" } }
     );
   }
 }
+

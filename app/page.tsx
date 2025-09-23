@@ -1,6 +1,6 @@
 'use client';
 
-import type { FormEvent } from 'react';
+import type { FormEvent, ChangeEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import { getMemoryPref } from '@/src/lib/session'; // uses /api/prefs
@@ -25,7 +25,6 @@ async function exchange(): Promise<ExchangeOK> {
     headers: { 'content-type': 'application/json' },
   });
   if (r.status === 401) {
-    // Expect { refresh: "https://herphut.com/sso/refresh?return=..." }
     const { refresh } = await r.json().catch(() => ({}));
     if (refresh) window.location.href = refresh;
     throw new Error('needs refresh');
@@ -33,6 +32,7 @@ async function exchange(): Promise<ExchangeOK> {
   if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
   return r.json();
 }
+// --------------------------------------------
 
 function NewChatLink({ onClick, visible }: { onClick: () => void; visible: boolean }) {
   if (!visible) return null;
@@ -53,6 +53,11 @@ export default function ChatPage() {
   ]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+
+  // NEW: image upload state
+  const [uploading, setUploading] = useState(false);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
 
   // boot state
   const [ready, setReady] = useState(false);
@@ -143,21 +148,57 @@ export default function ChatPage() {
 
   function handleNewChat() {
     setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
-    // keep same sessionId; server will continue that session
-    // (If you want a brand new session cookie/row, we can add an endpoint later)
+    // same session; we can add a “new session” endpoint later if you want
+  }
+
+  // NEW: open file picker
+  function pickImage() {
+    fileRef.current?.click();
+  }
+
+  // NEW: upload to /api/upload
+  async function onFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const r = await fetch('/api/upload', { method: 'POST', body: form, credentials: 'include' });
+      if (!r.ok) throw new Error(await r.text());
+      const j = await r.json();
+      setImageUrl(j.url || j.downloadUrl || null);
+    } catch {
+      // show a small chat bubble error
+      setMessages((m) => [...m, { role: 'assistant', content: 'Upload failed. Please try another image.' }]);
+    } finally {
+      setUploading(false);
+      // reset input so the same file can be picked again if needed
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  }
+
+  // NEW: remove selected image before sending
+  function clearImage() {
+    setImageUrl(null);
   }
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     const text = input.trim();
-    if (!text || sending) return;
+    if ((!text && !imageUrl) || sending) return; // require text or image
     if (!sessionId) {
       setMessages((m) => [...m, { role: 'assistant', content: 'No session yet—try again in a second.' }]);
       return;
     }
 
     setInput('');
-    const optimistic: LocalChatMessage[] = [...messages, { role: 'user', content: text }];
+    // Show optimistic user bubble; include a hint if there’s an image selected
+    const optimisticText =
+      imageUrl && text ? `${text}\n\n(Attached image: ${imageUrl})` :
+      imageUrl ? `(Attached image: ${imageUrl})` : text;
+
+    const optimistic: LocalChatMessage[] = [...messages, { role: 'user', content: optimisticText }];
     setMessages(optimistic);
     setSending(true);
 
@@ -165,31 +206,30 @@ export default function ChatPage() {
       // Build payload depending on memory setting
       const payload =
         memoryEnabled
-          // Memory ON → server pulls full history from DB
           ? {
               session_id: sessionId,
               user_id: userId,
-              messages: [{ role: 'user', content: text }],
+              messages: [{ role: 'user', content: text || '(image attached)' }],
+              image_url: imageUrl || undefined, // <-- NEW: pass to server (future vision branch)
             }
-          // Memory OFF (or anon) → send our rolling local history
           : {
               session_id: sessionId,
               user_id: userId,
               messages: buildRollingWindow(
                 messages.map((m) => ({ role: m.role, content: m.content })), // local transcript
-                text
+                optimisticText
               ),
+              image_url: imageUrl || undefined,
             };
 
       const res = await fetch('/api/chat', {
         method: 'POST',
-        credentials: 'include', // ensure cookies go with the request
+        credentials: 'include',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       });
       if (!res.ok) throw new Error(await res.text());
 
-      // Our route returns { messages: {role,content,created_at}[], diag: {...} }
       const data = await res.json();
       const serverMsgs =
         Array.isArray(data?.messages)
@@ -207,6 +247,8 @@ export default function ChatPage() {
       ]);
     } finally {
       setSending(false);
+      // clear image after send
+      setImageUrl(null);
     }
   }
 
@@ -216,14 +258,11 @@ export default function ChatPage() {
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
-      {/* LEFT: Sidebar — place NewChatLink just above recent chats */}
       <Sidebar headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />} />
 
-      {/* RIGHT: Chat UI */}
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'center' }}>
           <div style={{ width: '100%', maxWidth: 900 }}>
-            {/* tiny debug header */}
             <small style={{ opacity: 0.7 }}>
               session: {sessionId?.slice(0, 8)}… • user: {userId ?? 'anon'} • memory: {memoryEnabled ? 'ON' : 'OFF'}
             </small>
@@ -251,6 +290,8 @@ export default function ChatPage() {
                       borderRadius: '12px',
                       background: m.role === 'user' ? '#22c55e' : '#333',
                       color: m.role === 'user' ? '#000' : '#fff',
+                      maxWidth: 720,
+                      whiteSpace: 'pre-wrap',
                     }}
                   >
                     {m.content}
@@ -268,13 +309,85 @@ export default function ChatPage() {
                 borderRadius: '9999px',
                 padding: '4px 8px',
                 background: '#1a1c1f',
+                gap: 8,
               }}
             >
+              {/* NEW: hidden file input */}
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                style={{ display: 'none' }}
+                onChange={onFileChange}
+              />
+
+              {/* NEW: upload button (left of text input) */}
+              <button
+                type="button"
+                onClick={pickImage}
+                disabled={sending || uploading}
+                title={uploading ? 'Uploading…' : 'Upload image'}
+                style={{
+                  width: 36,
+                  height: 36,
+                  borderRadius: '50%',
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'transparent',
+                  color: '#fff',
+                  display: 'grid',
+                  placeItems: 'center',
+                  opacity: sending ? 0.6 : 1,
+                  cursor: sending ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {uploading ? '…' : '📷'}
+              </button>
+
+              {/* NEW: tiny preview pill if image selected */}
+              {imageUrl && (
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    background: '#262a2f',
+                    border: '1px solid #3a3f46',
+                    borderRadius: 999,
+                    padding: '3px 8px',
+                    maxWidth: 220,
+                  }}
+                  title={imageUrl}
+                >
+                  <img
+                    src={imageUrl}
+                    alt="preview"
+                    style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 6 }}
+                  />
+                  <span style={{ fontSize: 12, opacity: 0.8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    image attached
+                  </span>
+                  <button
+                    type="button"
+                    onClick={clearImage}
+                    aria-label="Remove image"
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#aaa',
+                      cursor: 'pointer',
+                      fontSize: 14,
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              )}
+
               <input
                 type="text"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Type your message..."
+                placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
                 disabled={sending}
                 style={{
                   flex: 1,
@@ -285,6 +398,7 @@ export default function ChatPage() {
                   padding: '8px',
                 }}
               />
+
               <button
                 type="submit"
                 disabled={sending}

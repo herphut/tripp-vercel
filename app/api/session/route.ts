@@ -38,28 +38,34 @@ export async function GET(req: NextRequest) {
         session_id: null,
         latency_ms: Date.now() - t0,
       });
-      return NextResponse.json([]);
+      return NextResponse.json([], { headers: { "Cache-Control": "no-store" } });
     }
 
-    // Pull last 25 sessions for this user
+    // Pull last 25 sessions for this user, most recently active first
     const rows = await db
       .select({
-        id: schema.chatSessions.id,
-        sessionId: schema.chatSessions.sessionId,
+        // Use sessionId as the stable identifier for the UI
+        id: schema.chatSessions.sessionId,
+        title: schema.chatSessions.title,
         created_at: schema.chatSessions.createdAt,
+        first_user_at: schema.chatSessions.firstUserAt,
         updated_at: schema.chatSessions.updatedAt,
+        last_seen: schema.chatSessions.lastSeen,
       })
       .from(schema.chatSessions)
       .where(eq(schema.chatSessions.userId, userId))
-      .orderBy(desc(schema.chatSessions.createdAt))
+      .orderBy(desc(schema.chatSessions.updatedAt))
       .limit(25);
 
-    // Sidebar expects: { id, title|null, created_at, updated_at }
+    // Sidebar expects at least: { id, title|null, created_at, updated_at }
+    // (We include first_user_at / last_seen too—harmless if the UI ignores them.)
     const out = rows.map((r) => ({
-      id: String(r.sessionId),      // use sessionId as stable identifier for UI selection
-      title: null as string | null, // no title column yet
+      id: String(r.id),
+      title: r.title ?? null,
       created_at: r.created_at,
+      first_user_at: r.first_user_at,
       updated_at: r.updated_at,
+      last_seen: r.last_seen,
     }));
 
     await auditLog({
@@ -71,7 +77,7 @@ export async function GET(req: NextRequest) {
       latency_ms: Date.now() - t0,
     });
 
-    return NextResponse.json(out);
+    return NextResponse.json(out, { headers: { "Cache-Control": "no-store" } });
   } catch (e: any) {
     await auditLog({
       route: "/api/session:GET",
@@ -82,6 +88,9 @@ export async function GET(req: NextRequest) {
       latency_ms: Date.now() - t0,
       error: String(e?.message || e),
     });
-    return NextResponse.json({ error: "session_list_failed" }, { status: 500 });
+    return NextResponse.json(
+      { error: "session_list_failed" },
+      { status: 500, headers: { "Cache-Control": "no-store" } }
+    );
   }
 }
