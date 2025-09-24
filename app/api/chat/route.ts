@@ -272,59 +272,116 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
-    // ---------- TOOL CALLING LOOP ----------
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+   // ---------- TOOL CALLING LOOP ----------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    let resp = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: modelMessages as any,
-      tools: openaiTools,
-      tool_choice: "auto",
-    });
+// Optional kill-switch for tools while debugging
+const toolsDisabled = process.env.TRIPP_DISABLE_TOOLS === "1";
 
-    // up to 2 tool rounds
-    for (let i = 0; i < 2; i++) {
-      // gather tool uses
-      const toolUses: Array<{ id: string; name: string; input: any }> = [];
-      for (const out of (resp as any).output ?? []) {
-        for (const part of out?.content ?? []) {
-          if (part?.type === "tool_use" && part?.name) {
-            toolUses.push({ id: part.id, name: part.name, input: part.input });
-          }
+// Only include tools if we actually have any and not disabled
+// Build Responses-API-shaped tools from your trippTools registry
+const toolsForModel =
+  process.env.TRIPP_DISABLE_TOOLS === "1" || trippTools.length === 0
+    ? undefined
+    : trippTools.map((t) => ({
+        type: "function" as const,
+        // NOTE: FunctionTool expects these at the top level
+        name: t.name,
+        description: t.description ?? "",
+        parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
+        strict: true,
+      }));
+
+// First call
+let resp: any;
+try {
+  resp = await openai.responses.create({
+    model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
+    input: modelMessages as any,
+    ...(toolsForModel ? { tools: toolsForModel, tool_choice: "auto" as const } : {}),
+  });
+} catch (err: any) {
+  const msg = `openai_create_failed: ${String(err?.message || err)}`;
+  await auditLog({
+    route: "/api/chat:POST",
+    status: 502,
+    client_id: clientId,
+    user_id: identityUserId,
+    session_id: sessionId,
+    latency_ms: Date.now() - t0,
+    error: msg,
+  });
+  const expose = process.env.TRIPP_DEBUG === "1";
+  return NextResponse.json(
+    { error: "openai_unavailable", reason: expose ? msg : "model_error" },
+    { status: 502, headers: { "Cache-Control": "no-store" } }
+  );
+}
+
+// Only loop if we actually sent tools
+if (toolsForModel) {
+  for (let i = 0; i < 2; i++) {
+    // Collect tool calls
+    const toolUses: Array<{ id: string; name: string; input: any }> = [];
+    for (const out of (resp as any).output ?? []) {
+      for (const part of out?.content ?? []) {
+        if (part?.type === "tool_use" && part?.name && part?.id) {
+          toolUses.push({ id: part.id, name: part.name, input: part.input });
         }
       }
-      if (toolUses.length === 0) break;
+    }
+    if (toolUses.length === 0) break;
 
-      // run tools and append tool_result messages
-      for (const tu of toolUses) {
-        let result: any = { error: "tool_failed" };
-        try {
-          result = await runToolByName(tu.name, tu.input, { request: req });
-        } catch (e: any) {
-          result = { error: String(e?.message || e) };
-        }
-
-        (modelMessages as any[]).push({
-          role: "tool",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: tu.id,
-              content: typeof result === "string" ? result : JSON.stringify(result),
-            },
-          ],
-        });
+    // Execute tools and append tool_result
+    for (const tu of toolUses) {
+      let result: any = { error: "tool_failed" };
+      try {
+        result = await runToolByName(tu.name, tu.input, { request: req });
+      } catch (e: any) {
+        result = { error: String(e?.message || e) };
       }
 
-      // ask model again with tool results appended
+      (modelMessages as any[]).push({
+        role: "tool",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: typeof result === "string" ? result : JSON.stringify(result),
+          },
+        ],
+      });
+    }
+
+    // Ask the model again with results appended
+    try {
       resp = await openai.responses.create({
         model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
         input: modelMessages as any,
-        tools: openaiTools,
+        tools: toolsForModel,
         tool_choice: "auto",
       });
+    } catch (err: any) {
+      const msg = `openai_followup_failed: ${String(err?.message || err)}`;
+      await auditLog({
+        route: "/api/chat:POST",
+        status: 502,
+        client_id: clientId,
+        user_id: identityUserId,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+        error: msg,
+      });
+      const expose = process.env.TRIPP_DEBUG === "1";
+      return NextResponse.json(
+        { error: "openai_unavailable", reason: expose ? msg : "model_error" },
+        { status: 502, headers: { "Cache-Control": "no-store" } }
+      );
     }
-    // ---------- end tool loop ----------
+  }
+}
+// ---------- end tool loop ----------
+
 
     const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
 
