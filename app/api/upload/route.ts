@@ -1,60 +1,104 @@
 // app/api/upload/route.ts
 import { NextRequest, NextResponse } from "next/server";
-export const runtime = "nodejs"; // Blob SDK needs Node runtime
-import { put, del } from "@vercel/blob";
-import { randomUUID } from "crypto";
+import { put } from "@vercel/blob";
+import crypto from "crypto";
+import { db, schema } from "@/db/db";
+import { auditLog } from "@/app/api/_lib/audit";
+import { getIdentity } from "@/app/api/_lib/identity";
 
-const MAX_MB = Number(process.env.UPLOAD_MAX_MB || 8); // tweak as you like
+export const runtime = "edge"; // blob works great on edge
 
-function bad(msg: string, code = 400) {
-  return NextResponse.json({ error: msg }, { status: code });
+function bad(status: number, error: string) {
+  return NextResponse.json({ error }, { status });
 }
 
 export async function POST(req: NextRequest) {
-  // Expect multipart/form-data with field "file"
-  const form = await req.formData().catch(() => null);
-  const file = form?.get("file") as File | null;
-  if (!file) return bad("No file");
+  const t0 = Date.now();
+  const { client_id, user_id } = await getIdentity(req);
 
-  // Basic validation
-  const bytes = file.size;
-  const mb = bytes / (1024 * 1024);
-  if (mb > MAX_MB) return bad(`File too large (>${MAX_MB}MB)`);
+  try {
+    const ct = req.headers.get("content-type") || "";
+    if (!ct.includes("multipart/form-data")) {
+      await auditLog({
+        route: "/api/upload:POST",
+        status: 415,
+        client_id,
+        user_id,
+        latency_ms: Date.now() - t0,
+        error: "unsupported_media_type",
+      });
+      return bad(415, "expected multipart/form-data");
+    }
 
-  const okMime = /^image\/(png|jpeg|jpg|webp|gif|bmp|tiff|svg\+xml)$/i.test(file.type);
-  if (!okMime) return bad(`Unsupported type: ${file.type || "unknown"}`);
+    const form = await req.formData();
+    const file = form.get("file") as unknown as File | null;
+    const sessionId = String(form.get("session_id") || "").trim();
 
-  // Build a clean, unique key
-  const origName = (file.name || "upload").toLowerCase();
-  const ext = (origName.match(/\.[a-z0-9+]+$/i)?.[0] || "").replace(/[^a-z0-9.+]/gi, "");
-  const key = `uploads/${new Date().toISOString().slice(0,10)}/${randomUUID()}${ext || ".bin"}`;
+    if (!file || !sessionId) {
+      await auditLog({
+        route: "/api/upload:POST",
+        status: 400,
+        client_id,
+        user_id,
+        latency_ms: Date.now() - t0,
+        error: "missing_file_or_session",
+      });
+      return bad(400, "missing file or session_id");
+    }
 
-  // Upload to Vercel Blob
-  const { url, pathname, contentType, downloadUrl } = await put(key, file, {
-    access: "public",
-    token: process.env.BLOB_READ_WRITE_TOKEN!,
-    contentType: file.type || undefined,
-    addRandomSuffix: false,
-    cacheControlMaxAge: 60 * 60 * 24 * 365, // 1 year
-  });
+    // Generate a stable-ish blob name
+    const ext = (file.name?.split(".").pop() || "bin").toLowerCase();
+    const key = `uploads/${sessionId}/${Date.now()}-${crypto.randomUUID()}.${ext}`;
 
-  return NextResponse.json({
-    ok: true,
-    url,            // public https URL for model/tools
-    downloadUrl,    // direct download URL (handy for “Save image” buttons)
-    key: pathname,  // blob key if you want to delete later
-    size: bytes,
-    contentType,
-  });
-}
+    // Upload to Vercel Blob
+    const putRes = await put(key, file, {
+      access: "public", // switch to "private" + signed URLs later if desired
+      addRandomSuffix: false,
+      contentType: file.type || "application/octet-stream",
+    });
 
-// Optional: allow DELETE ?url=<blob public URL> (or key) to remove uploads
-export async function DELETE(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const url = searchParams.get("url");
-  const key = searchParams.get("key");
-  if (!url && !key) return bad("Missing url or key");
-  const target = url ?? key!;
-  await del(target, { token: process.env.BLOB_READ_WRITE_TOKEN! });
-  return NextResponse.json({ ok: true });
+    // Record an attachment row in Neon
+    const url = putRes.url;
+    const mime = file.type || null;
+    const sizeBytes = Number((file as any).size ?? 0) || null;
+
+    const [row] = await db
+      .insert(schema.attachments)
+      .values({
+        sessionId,
+        userId: user_id ?? null, // null = anon
+        kind: "image",
+        url,
+        mime,
+        sizeBytes,
+        source: "upload",
+      })
+      .returning({ id: schema.attachments.id });
+
+    await auditLog({
+      route: "/api/upload:POST",
+      status: 200,
+      client_id,
+      user_id,
+      session_id: sessionId,
+      latency_ms: Date.now() - t0,
+    });
+
+    return NextResponse.json({
+      id: row?.id,
+      url,
+      mime,
+      sizeBytes,
+    });
+  } catch (e: any) {
+    await auditLog({
+      route: "/api/upload:POST",
+      status: 500,
+      client_id,
+      user_id,
+      latency_ms: Date.now() - t0,
+      error: String(e?.message || e),
+    });
+    return bad(500, "upload_failed");
+  }
 }

@@ -1,25 +1,54 @@
-// schema.ts
+// @/src/db/schema.ts
 import {
-  pgSchema, pgTable, serial, bigserial, varchar, text, timestamp, integer, boolean, index
+  pgSchema, pgTable,
+  serial, bigserial, bigint,
+  varchar, text, timestamp, integer, boolean, index
 } from "drizzle-orm/pg-core";
 
+// Define the schema ONCE here. Remove any `import { tripp } from "./schema_root"`
 export const tripp = pgSchema("tripp");
 
-// 1) User prefs (SSO user_id is the PK)
+/* ----------------------- ATTACHMENTS ----------------------- */
+export const attachments = tripp.table(
+  "attachments",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    sessionId: varchar("session_id", { length: 64 }).notNull(),
+    // match chat_messages.id (bigserial) width:
+    messageId: bigint("message_id", { mode: "number" }), // nullable; link after message insert
+    userId: text("user_id"), // nullable for anon
+    kind: varchar("kind", { length: 16 }).notNull().default("image"), // 'image' | 'file'
+    url: text("url").notNull(),     // Blob public URL (or signed URL)
+    mime: varchar("mime", { length: 100 }),
+    sizeBytes: integer("size_bytes"),
+    width: integer("width"),
+    height: integer("height"),
+    sha256: varchar("sha256", { length: 64 }),
+    source: varchar("source", { length: 32 }).notNull().default("upload"), // 'upload'|'tool'|'system'
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    deleted: boolean("deleted").notNull().default(false),
+  },
+  (t) => ({
+    bySession: index("attachments_session_idx").on(t.sessionId),
+    byMessage: index("attachments_message_idx").on(t.messageId),
+  })
+);
+
+/* ----------------------- USER PREFS ------------------------ */
 export const userPrefs = tripp.table("user_prefs", {
-  userId: text("user_id").primaryKey(),
+  userId: text("user_id").primaryKey(), // SSO user id
   memoryOptIn: boolean("memory_opt_in").notNull().default(false),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-// 2) Chat sessions
+/* ----------------------- CHAT SESSIONS --------------------- */
 export const chatSessions = tripp.table(
   "chat_sessions",
   {
     id: bigserial("id", { mode: "number" }).primaryKey(),
     sessionId: varchar("session_id", { length: 64 }).notNull().unique(),
     clientId: varchar("client_id", { length: 64 }),
-    userId: text("user_id"), // <- unify on SSO text id
+    userId: text("user_id"),
     tier: varchar("tier", { length: 32 }).notNull().default("free"),
 
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -48,16 +77,17 @@ export const chatSessions = tripp.table(
   })
 );
 
-// 3) Chat messages
+/* ----------------------- CHAT MESSAGES --------------------- */
 export const chatMessages = tripp.table(
   "chat_messages",
   {
     id: bigserial("id", { mode: "number" }).primaryKey(),
     sessionId: varchar("session_id", { length: 64 }).notNull(),
-    userId: text("user_id"), // optional; still SSO text when present
+    userId: text("user_id"),
     role: varchar("role", { length: 16 }).notNull(), // 'user'|'assistant'|'system'
     content: text("content"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+
     contentLen: integer("content_len"),
     contentSha256: varchar("content_sha256", { length: 64 }),
     contentRedacted: boolean("content_redacted").notNull().default(false),
@@ -68,7 +98,7 @@ export const chatMessages = tripp.table(
   })
 );
 
-// 4) Memories (KV)
+/* ----------------------- MEMORIES (KV) --------------------- */
 export const memories = tripp.table(
   "memories",
   {
@@ -82,11 +112,11 @@ export const memories = tripp.table(
   },
   (t) => ({
     byUserNsKey: index("memories_user_ns_key_idx").on(t.userId, t.namespace, t.key),
-    // Later: unique("memories_user_ns_key_uq").on(t.userId, t.namespace, t.key),
+    // When ready: unique("memories_user_ns_key_uq").on(t.userId, t.namespace, t.key),
   })
 );
 
-// 5) Client usage
+/* ----------------------- CLIENT USAGE ---------------------- */
 export const clientUsage = tripp.table(
   "client_usage",
   {
@@ -105,7 +135,7 @@ export const clientUsage = tripp.table(
   })
 );
 
-// 6) Audit logs
+/* ----------------------- AUDIT LOGS ------------------------ */
 export const auditLogs = tripp.table(
   "audit_logs",
   {
