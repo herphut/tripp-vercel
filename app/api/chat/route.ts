@@ -23,7 +23,7 @@ const HISTORY_LIMIT = 30;
 type TextTurn = { role: "system" | "user" | "assistant"; content: string };
 type VisionPart =
   | { type: "input_text"; text: string }
-  | { type: "input_image"; image_url: string; detail: "low" | "high" | "auto" }; // <-- detail REQUIRED
+  | { type: "input_image"; image_url: string; detail: "low" | "high" | "auto" };
 type VisionTurn = { role: "user"; content: VisionPart[] };
 type ToolTurn = { role: "tool"; content: any[] };
 type ModelTurn = TextTurn | VisionTurn | ToolTurn;
@@ -76,14 +76,19 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
-// Map our Tool registry to Responses API tool schema (no nested `function` key)
-const openaiTools = trippTools.map((t) => ({
-  type: "function" as const,
-  name: t.name,
-  description: t.description ?? "",
-  parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
-  strict: true,
-}));
+// Build Responses-API tools from registry (nested `function` object)
+const toolsForModel =
+  process.env.TRIPP_DISABLE_TOOLS === "1" || trippTools.length === 0
+    ? undefined
+    : (trippTools.map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description ?? "",
+          parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
+        },
+        strict: true,
+      })) as any);
 
 // Execute a tool by name
 async function runToolByName(name: string, args: unknown, ctx: { request: NextRequest }): Promise<any> {
@@ -272,97 +277,26 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
-   // ---------- TOOL CALLING LOOP ----------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    // ---------- TOOL CALLING LOOP ----------
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-// Optional kill-switch for tools while debugging
-const toolsDisabled = process.env.TRIPP_DISABLE_TOOLS === "1";
-
-// Only include tools if we actually have any and not disabled
-// Build Responses-API-shaped tools from your trippTools registry
-const toolsForModel =
-  process.env.TRIPP_DISABLE_TOOLS === "1" || trippTools.length === 0
-    ? undefined
-    : trippTools.map((t) => ({
-        type: "function" as const,
-        // NOTE: FunctionTool expects these at the top level
-        name: t.name,
-        description: t.description ?? "",
-        parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
-        strict: true,
-      }));
-
-// First call
-let resp: any;
-try {
-  resp = await openai.responses.create({
-    model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
-    input: modelMessages as any,
-    ...(toolsForModel ? { tools: toolsForModel, tool_choice: "auto" as const } : {}),
-  });
-} catch (err: any) {
-  const msg = `openai_create_failed: ${String(err?.message || err)}`;
-  await auditLog({
-    route: "/api/chat:POST",
-    status: 502,
-    client_id: clientId,
-    user_id: identityUserId,
-    session_id: sessionId,
-    latency_ms: Date.now() - t0,
-    error: msg,
-  });
-  const expose = process.env.TRIPP_DEBUG === "1";
-  return NextResponse.json(
-    { error: "openai_unavailable", reason: expose ? msg : "model_error" },
-    { status: 502, headers: { "Cache-Control": "no-store" } }
-  );
-}
-
-// Only loop if we actually sent tools
-if (toolsForModel) {
-  for (let i = 0; i < 2; i++) {
-    // Collect tool calls
-    const toolUses: Array<{ id: string; name: string; input: any }> = [];
-    for (const out of (resp as any).output ?? []) {
-      for (const part of out?.content ?? []) {
-        if (part?.type === "tool_use" && part?.name && part?.id) {
-          toolUses.push({ id: part.id, name: part.name, input: part.input });
-        }
-      }
-    }
-    if (toolUses.length === 0) break;
-
-    // Execute tools and append tool_result
-    for (const tu of toolUses) {
-      let result: any = { error: "tool_failed" };
-      try {
-        result = await runToolByName(tu.name, tu.input, { request: req });
-      } catch (e: any) {
-        result = { error: String(e?.message || e) };
-      }
-
-      (modelMessages as any[]).push({
-        role: "tool",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: tu.id,
-            content: typeof result === "string" ? result : JSON.stringify(result),
-          },
-        ],
-      });
-    }
-
-    // Ask the model again with results appended
+    // First call
+    let resp: any;
     try {
       resp = await openai.responses.create({
         model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
         input: modelMessages as any,
-        tools: toolsForModel,
-        tool_choice: "auto",
+        ...(toolsForModel ? { tools: toolsForModel, tool_choice: "auto" as const } : {}),
       });
     } catch (err: any) {
-      const msg = `openai_followup_failed: ${String(err?.message || err)}`;
+      const status = err?.status || err?.response?.status;
+      const apiMsg =
+        err?.error?.message ||
+        err?.response?.data?.error?.message ||
+        err?.response?.data?.message ||
+        err?.message ||
+        String(err);
+
       await auditLog({
         route: "/api/chat:POST",
         status: 502,
@@ -370,18 +304,85 @@ if (toolsForModel) {
         user_id: identityUserId,
         session_id: sessionId,
         latency_ms: Date.now() - t0,
-        error: msg,
+        error: `openai_error status=${status} msg=${apiMsg}`,
       });
-      const expose = process.env.TRIPP_DEBUG === "1";
+
       return NextResponse.json(
-        { error: "openai_unavailable", reason: expose ? msg : "model_error" },
+        { error: "openai_unavailable", reason: "model_error", detail: apiMsg },
         { status: 502, headers: { "Cache-Control": "no-store" } }
       );
     }
-  }
-}
-// ---------- end tool loop ----------
 
+    // Only loop if tools are included
+    if (toolsForModel) {
+      for (let i = 0; i < 2; i++) {
+        // Collect tool calls
+        const toolUses: Array<{ id: string; name: string; input: any }> = [];
+        for (const out of (resp as any).output ?? []) {
+          for (const part of out?.content ?? []) {
+            if (part?.type === "tool_use" && part?.name && part?.id) {
+              toolUses.push({ id: part.id, name: part.name, input: part.input });
+            }
+          }
+        }
+        if (toolUses.length === 0) break;
+
+        // Execute tools and append tool_result
+        for (const tu of toolUses) {
+          let result: any = { error: "tool_failed" };
+          try {
+            result = await runToolByName(tu.name, tu.input, { request: req });
+          } catch (e: any) {
+            result = { error: String(e?.message || e) };
+          }
+
+          (modelMessages as any[]).push({
+            role: "tool",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: tu.id,
+                content: typeof result === "string" ? result : JSON.stringify(result),
+              },
+            ],
+          });
+        }
+
+        // Ask the model again with results appended
+        try {
+          resp = await openai.responses.create({
+            model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
+            input: modelMessages as any,
+            tools: toolsForModel,
+            tool_choice: "auto",
+          });
+        } catch (err: any) {
+          const status = err?.status || err?.response?.status;
+          const apiMsg =
+            err?.error?.message ||
+            err?.response?.data?.error?.message ||
+            err?.response?.data?.message ||
+            err?.message ||
+            String(err);
+
+          await auditLog({
+            route: "/api/chat:POST",
+            status: 502,
+            client_id: clientId,
+            user_id: identityUserId,
+            session_id: sessionId,
+            latency_ms: Date.now() - t0,
+            error: `openai_error status=${status} msg=${apiMsg}`,
+          });
+
+          return NextResponse.json(
+            { error: "openai_unavailable", reason: "model_error", detail: apiMsg },
+            { status: 502, headers: { "Cache-Control": "no-store" } }
+          );
+        }
+      }
+    }
+    // ---------- end tool loop ----------
 
     const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
 
@@ -419,7 +420,10 @@ if (toolsForModel) {
               .filter((m: any) => m.role !== "system")
               .map((m: any) => ({
                 role: m.role,
-                content: typeof m.content === "string" ? m.content : last.content, // simple fallback for non-persisted path
+                content:
+                  typeof (m as any).content === "string"
+                    ? (m as any).content
+                    : "[non-text message]",
                 created_at: new Date().toISOString(),
               })),
             { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
@@ -435,7 +439,7 @@ if (toolsForModel) {
     });
 
     return NextResponse.json(
-      { messages, diag: { openai_used: true, tools_enabled: true, persisted: persist, memory_scope: identityUserId ? "user" : "session" } },
+      { messages, diag: { openai_used: true, tools_enabled: !!toolsForModel, persisted: persist, memory_scope: identityUserId ? "user" : "session" } },
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (e: any) {
