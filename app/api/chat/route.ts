@@ -23,7 +23,7 @@ const HISTORY_LIMIT = 30;
 type TextTurn = { role: "system" | "user" | "assistant"; content: string };
 type VisionPart =
   | { type: "input_text"; text: string }
-  | { type: "input_image"; image_url: string; detail: "low" | "high" | "auto" };
+  | { type: "input_image"; image_url: string; detail: "low" | "high" | "auto" }; // detail required
 type VisionTurn = { role: "user"; content: VisionPart[] };
 type ToolTurn = { role: "tool"; content: any[] };
 type ModelTurn = TextTurn | VisionTurn | ToolTurn;
@@ -76,19 +76,33 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
-// Build Responses-API tools from registry (nested `function` object)
-const toolsForModel =
-  process.env.TRIPP_DISABLE_TOOLS === "1" || trippTools.length === 0
-    ? undefined
-    : (trippTools.map((t) => ({
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description ?? "",
-          parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
-        },
-        strict: true,
-      })) as any);
+// Build Responses-API tools (FLAT function tool schema)
+function buildToolsForModel():
+  | Array<{
+      type: "function";
+      name: string;
+      description?: string;
+      parameters: any;   // NOTE: not optional
+      strict?: boolean;
+    }>
+  | undefined {
+  if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
+  if (!Array.isArray(trippTools) || trippTools.length === 0) return undefined;
+
+  const arr = trippTools
+    .filter(t => t && typeof t.name === "string" && t.name.trim().length > 0)
+    .map(t => ({
+      type: "function" as const,
+      name: t.name,
+      description: t.description ?? "",
+      // Always provide a JSON schema object:
+      parameters: (t.input_schema as any) ?? { type: "object", properties: {} },
+      strict: true,
+    }));
+
+  return arr.length ? arr : undefined;
+}
+
 
 // Execute a tool by name
 async function runToolByName(name: string, args: unknown, ctx: { request: NextRequest }): Promise<any> {
@@ -189,13 +203,13 @@ export async function POST(req: NextRequest) {
         .slice(-HISTORY_LIMIT)
         .map((h) => ({ role: h.role as "user" | "assistant", content: h.content ?? "" }));
 
-      modelMessages.push(...trimmed);
+      modelMessages.push(...(trimmed as ModelTurn[]));
     } else {
       const rolling = body.messages
         .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
         .slice(-HISTORY_LIMIT)
         .map((m) => ({ role: m.role, content: m.content }));
-      modelMessages.push(...rolling);
+      modelMessages.push(...(rolling as ModelTurn[]));
 
       const needLast =
         rolling.length === 0 ||
@@ -277,8 +291,9 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
-    // ---------- TOOL CALLING LOOP ----------
+// ---------- TOOL CALLING LOOP ----------
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    const toolsForModel = buildToolsForModel();
 
     // First call
     let resp: any;
@@ -286,17 +301,10 @@ export async function POST(req: NextRequest) {
       resp = await openai.responses.create({
         model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
         input: modelMessages as any,
-        ...(toolsForModel ? { tools: toolsForModel, tool_choice: "auto" as const } : {}),
+        ...(toolsForModel ? { tools: toolsForModel as any, tool_choice: "auto" as const } : {}),
       });
     } catch (err: any) {
-      const status = err?.status || err?.response?.status;
-      const apiMsg =
-        err?.error?.message ||
-        err?.response?.data?.error?.message ||
-        err?.response?.data?.message ||
-        err?.message ||
-        String(err);
-
+      const msg = `openai_create_failed: ${String(err?.message || err)}`;
       await auditLog({
         route: "/api/chat:POST",
         status: 502,
@@ -304,16 +312,16 @@ export async function POST(req: NextRequest) {
         user_id: identityUserId,
         session_id: sessionId,
         latency_ms: Date.now() - t0,
-        error: `openai_error status=${status} msg=${apiMsg}`,
+        error: msg,
       });
-
+      const expose = process.env.TRIPP_DEBUG === "1";
       return NextResponse.json(
-        { error: "openai_unavailable", reason: "model_error", detail: apiMsg },
+        { error: "openai_unavailable", reason: expose ? msg : "model_error" },
         { status: 502, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Only loop if tools are included
+    // Only loop if we actually sent tools
     if (toolsForModel) {
       for (let i = 0; i < 2; i++) {
         // Collect tool calls
@@ -353,7 +361,7 @@ export async function POST(req: NextRequest) {
           resp = await openai.responses.create({
             model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
             input: modelMessages as any,
-            tools: toolsForModel,
+            tools: toolsForModel as any,
             tool_choice: "auto",
           });
         } catch (err: any) {
@@ -384,7 +392,7 @@ export async function POST(req: NextRequest) {
     }
     // ---------- end tool loop ----------
 
-    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty."; 
 
     // persist assistant turn if memory on
     if (persist) {
@@ -420,10 +428,7 @@ export async function POST(req: NextRequest) {
               .filter((m: any) => m.role !== "system")
               .map((m: any) => ({
                 role: m.role,
-                content:
-                  typeof (m as any).content === "string"
-                    ? (m as any).content
-                    : "[non-text message]",
+                content: typeof m.content === "string" ? m.content : last.content,
                 created_at: new Date().toISOString(),
               })),
             { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
@@ -458,3 +463,4 @@ export async function POST(req: NextRequest) {
     );
   }
 }
+
