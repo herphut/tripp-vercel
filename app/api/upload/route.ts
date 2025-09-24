@@ -1,7 +1,6 @@
 // app/api/upload/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { put } from "@vercel/blob";
-import crypto from "crypto";
 import { db, schema } from "@/db/db";
 import { auditLog } from "@/app/api/_lib/audit";
 import { getIdentity } from "@/app/api/_lib/identity";
