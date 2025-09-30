@@ -119,21 +119,198 @@ export async function POST(req: NextRequest) {
   let sessionId: UUID = crypto.randomUUID() as UUID;
 
   try {
-    // ---- 4) Reuse latest non-revoked session for this device (user or guest) ----
-    const existing = await db
+    // =========================
+    // 4) Reuse / Upgrade / Insert (safe, race-tolerant)
+    // =========================
+    try {
+      if (!isGuest) {
+        const uid = userId as string; // <-- narrow non-null type for TS
+        // 4a) Do we already have an active row for this user+device?
+        const existingUser = await db
+          .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
+          .from(chatSessions)
+          .where(
+            and(
+              eq(chatSessions.userId, uid),
+              eq(chatSessions.deviceHash, deviceHash),
+              sql`revoked_at IS NULL`
+            )
+          )
+          .orderBy(desc(chatSessions.createdAt))
+          .limit(1);
+
+        if (existingUser.length) {
+          sessionId = existingUser[0].sessionId as UUID;
+          await db
+            .update(chatSessions)
+            .set({
+              updatedAt: now,
+              lastSeen: now,
+              expiresAt,
+              tier,
+              clientId: CLIENT_ID,
+            })
+            .where(eq(chatSessions.id, existingUser[0].id));
+        } else {
+          // 4b) No user+device row: claim any active guest row on this device
+          const existingGuest = await db
+            .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
+            .from(chatSessions)
+            .where(
+              and(
+                sql`user_id IS NULL`,
+                eq(chatSessions.deviceHash, deviceHash),
+                sql`revoked_at IS NULL`
+              )
+            )
+            .orderBy(desc(chatSessions.createdAt))
+            .limit(1);
+
+          if (existingGuest.length) {
+            sessionId = existingGuest[0].sessionId as UUID;
+            await db
+              .update(chatSessions)
+              .set({
+                userId,                 // upgrade guest → user
+                updatedAt: now,
+                lastSeen: now,
+                expiresAt,
+                tier,
+                clientId: CLIENT_ID,
+              })
+              .where(eq(chatSessions.id, existingGuest[0].id));
+          } else {
+            // 4c) Insert fresh row
+            await db
+              .insert(chatSessions)
+              .values({
+                sessionId,
+                clientId: CLIENT_ID,
+                userId,
+                tier,
+                createdAt: now,
+                updatedAt: now,
+                expiresAt,
+                lastSeen: now,
+                revokedAt: null,
+                deviceHash,
+                uaHash,
+                ipHash,
+                jti: (payload?.jti as string) || null,
+                kid: header?.kid || null,
+                iss: (payload?.iss as string) || null,
+                aud: (payload?.aud as string) || null,
+              })
+              .onConflictDoUpdate({
+                // guard UNIQUE(session_id) races
+                target: chatSessions.sessionId,
+                set: {
+                  updatedAt: now,
+                  lastSeen: now,
+                  expiresAt,
+                  tier,
+                  clientId: CLIENT_ID,
+                  userId,
+                },
+              });
+          }
+
+          // 4d) Cap active sessions per user
+          await db.execute(sql`
+            WITH active AS (
+              SELECT id FROM tripp.chat_sessions
+              WHERE user_id = ${userId} AND revoked_at IS NULL
+              ORDER BY created_at DESC
+            )
+            UPDATE tripp.chat_sessions
+            SET revoked_at = NOW()
+            WHERE id IN (SELECT id FROM active OFFSET ${MAX_SESS})
+          `);
+        }
+      } else {
+        // Guest path: reuse any active device session (guest or prior), else insert
+        const existingAny = await db
+          .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
+          .from(chatSessions)
+          .where(
+            and(
+              eq(chatSessions.deviceHash, deviceHash),
+              sql`revoked_at IS NULL`
+            )
+          )
+          .orderBy(desc(chatSessions.createdAt))
+          .limit(1);
+
+        if (existingAny.length) {
+          sessionId = existingAny[0].sessionId as UUID;
+          await db
+            .update(chatSessions)
+            .set({
+              updatedAt: now,
+              lastSeen: now,
+              expiresAt,
+              tier,                // "guest"
+              clientId: CLIENT_ID,
+              userId: null,
+            })
+            .where(eq(chatSessions.id, existingAny[0].id));
+        } else {
+          await db
+            .insert(chatSessions)
+            .values({
+              sessionId,
+              clientId: CLIENT_ID,
+              userId: null,
+              tier,                // "guest"
+              createdAt: now,
+              updatedAt: now,
+              expiresAt,
+              lastSeen: now,
+              revokedAt: null,
+              deviceHash,
+              uaHash,
+              ipHash,
+              jti: null,
+              kid: null,
+              iss: null,
+              aud: null,
+            })
+            .onConflictDoUpdate({
+              target: chatSessions.sessionId,
+              set: {
+                updatedAt: now,
+                lastSeen: now,
+                expiresAt,
+                tier,
+                clientId: CLIENT_ID,
+                userId: null,
+              },
+            });
+        }
+      }
+   } catch (e: any) {
+  // Recover from duplicate user_id+device_hash race
+  const code = e?.cause?.code || e?.code;
+  if (code === "23505") {
+    // Narrow inside this block too
+    const uid = isGuest ? null : (userId as string);
+
+    const row = await db
       .select({ id: chatSessions.id, sessionId: chatSessions.sessionId })
       .from(chatSessions)
       .where(
         and(
           eq(chatSessions.deviceHash, deviceHash),
-          sql`revoked_at IS NULL`
+          sql`revoked_at IS NULL`,
+          // Only apply the user filter when not a guest
+          isGuest ? sql`TRUE` : eq(chatSessions.userId, uid as string)
         )
       )
       .orderBy(desc(chatSessions.createdAt))
       .limit(1);
 
-    if (existing.length) {
-      sessionId = existing[0].sessionId as UUID;
+    if (row.length) {
+      sessionId = row[0].sessionId as UUID;
       await db
         .update(chatSessions)
         .set({
@@ -142,57 +319,20 @@ export async function POST(req: NextRequest) {
           expiresAt,
           tier,
           clientId: CLIENT_ID,
-          userId: userId ?? null,
+          userId: isGuest ? null : (uid as string),
         })
-        .where(eq(chatSessions.id, existing[0].id));
+        .where(eq(chatSessions.id, row[0].id));
     } else {
-      // ---- 5) Insert new session (UPSERT on UNIQUE(session_id)) ----
-      await db
-        .insert(chatSessions)
-        .values({
-          sessionId,
-          clientId: CLIENT_ID,
-          userId: userId ?? null,
-          tier,
-          createdAt: now,
-          updatedAt: now,
-          expiresAt,
-          lastSeen: now,
-          revokedAt: null,
-          deviceHash,
-          uaHash,
-          ipHash,
-          jti: isGuest ? null : (payload.jti as string) || null,
-          kid: header?.kid || null,
-          iss: isGuest ? null : (payload.iss as string) || null,
-          aud: isGuest ? null : (payload.aud as string) || null,
-        })
-        .onConflictDoUpdate({
-          target: chatSessions.sessionId,
-          set: {
-            updatedAt: now,
-            lastSeen: now,
-            expiresAt,
-            tier,
-            clientId: CLIENT_ID,
-            userId: userId ?? null,
-          },
-        });
-
-      // ---- 6) Cap sessions per *user* (guests excluded) ----
-      if (userId) {
-        await db.execute(sql`
-          WITH active AS (
-            SELECT id FROM tripp.chat_sessions
-            WHERE user_id = ${userId} AND revoked_at IS NULL
-            ORDER BY created_at DESC
-          )
-          UPDATE tripp.chat_sessions
-          SET revoked_at = NOW()
-          WHERE id IN (SELECT id FROM active OFFSET ${MAX_SESS})
-        `);
-      }
+      throw e; // bubble if truly unrecoverable
     }
+  } else {
+    throw e;
+  }
+}
+
+    // =========================
+    // end Section 4
+    // =========================
 
     // ---- 7) Set HH_SESSION_ID cookie (prod vs dev safe) ----
     const host = req.headers.get("host") || "";
