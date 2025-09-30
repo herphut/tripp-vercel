@@ -1,4 +1,5 @@
 // lib/jwks.ts
+import "server-only";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const JWKS = createRemoteJWKSet(

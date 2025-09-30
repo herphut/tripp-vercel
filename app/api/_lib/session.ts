@@ -1,3 +1,4 @@
+import "server-only";
 export type MemoryOptIn = boolean;
 
 function readBoolShape(j: any): MemoryOptIn | null {

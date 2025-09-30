@@ -21,6 +21,7 @@
     "@neondatabase/serverless": "^1.0.1",
     "@openai/agents": "^0.1.1",
     "@vercel/blob": "^2.0.0",
+    "ajv": "^8.17.1",
     "dotenv": "^17.2.2",
     "drizzle-orm": "^0.44.5",
     "jose": "^6.1.0",

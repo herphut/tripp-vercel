@@ -1,4 +1,5 @@
-// src/agents/tools.ts
+// app/api/_lib/agents/tools.ts  (or src/agents/tools.ts if you haven't moved yet)
+import "server-only";
 import OpenAI from "openai";
 import type { NextRequest } from "next/server";
 
@@ -18,28 +19,66 @@ export interface Tool<Args, Result> {
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 // ----------------------
+// Small utilities
+// ----------------------
+function withTimeout<T>(p: Promise<T>, ms = 10000): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
+  ]);
+}
+
+// (Optional) super-simple allowlist if you want to restrict where images can be fetched from.
+// function isAllowedImageUrl(u: string) {
+//   try {
+//     const url = new URL(u);
+//     const allowed = new Set([
+//       "blob.vercel-storage.com",
+//       "public.blob.vercel-storage.com",
+//       "tripp.herphut.com",
+//       "herphut.com",
+//     ]);
+//     return allowed.has(url.hostname);
+//   } catch {
+//     return false;
+//   }
+// }
+
+async function fetchAsBlob(url: string, maxBytes = 8 * 1024 * 1024): Promise<Blob> {
+  const r = await withTimeout(fetch(url, { cache: "no-store" }), 12000);
+  if (!r.ok) throw new Error(`fetch ${r.status}`);
+  const len = Number(r.headers.get("content-length") || 0);
+  if (len && len > maxBytes) throw new Error("image too large");
+  const ab = await r.arrayBuffer();
+  if (ab.byteLength > maxBytes) throw new Error("image too large");
+  return new Blob([ab]);
+}
+
+// ----------------------
 // Web Search (Tavily/Brave)
 // ----------------------
-
 export type WebResult = { title: string; url: string; snippet?: string };
 
 async function searchWithTavily(query: string, limit = 5): Promise<WebResult[]> {
   const key = process.env.TAVILY_API_KEY;
   if (!key) return [];
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify({
-      api_key: key,
-      query,
-      search_depth: "basic",
-      max_results: limit,
-      include_answers: false,
-      include_images: false,
-      include_image_descriptions: false,
+  const r = await withTimeout(
+    fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        api_key: key,
+        query,
+        search_depth: "basic",
+        max_results: limit,
+        include_answers: false,
+        include_images: false,
+        include_image_descriptions: false,
+      }),
     }),
-  });
+    12000
+  );
   if (!r.ok) return [];
   const j = await r.json();
   const results: any[] = Array.isArray(j?.results) ? j.results : [];
@@ -56,10 +95,10 @@ async function searchWithBrave(query: string, limit = 5): Promise<WebResult[]> {
   const url = new URL("https://api.search.brave.com/res/v1/web/search");
   url.searchParams.set("q", query);
   url.searchParams.set("count", String(limit));
-  const r = await fetch(url.toString(), {
-    headers: { "X-Subscription-Token": key },
-    cache: "no-store",
-  });
+  const r = await withTimeout(
+    fetch(url.toString(), { headers: { "X-Subscription-Token": key }, cache: "no-store" }),
+    12000
+  );
   if (!r.ok) return [];
   const j = await r.json();
   const results: any[] = j?.web?.results ?? [];
@@ -91,10 +130,11 @@ export const searchWebTool: Tool<
   input_schema: {
     type: "object",
     properties: {
-      query: { type: "string" },
+      query: { type: "string", minLength: 1 },
       limit: { type: "number", minimum: 1, maximum: 10 },
     },
     required: ["query"],
+    additionalProperties: false,
   },
   async execute({ query, limit = 5 }) {
     const results = await webSearch(query, limit);
@@ -114,12 +154,14 @@ export const visionAnalyzeTool: Tool<
   input_schema: {
     type: "object",
     properties: {
-      imageUrl: { type: "string" },
+      imageUrl: { type: "string", minLength: 1 },
       question: { type: "string" },
     },
     required: ["imageUrl"],
+    additionalProperties: false,
   },
   async execute({ imageUrl, question }) {
+    // if (!isAllowedImageUrl(imageUrl)) return { answer: "Unsupported image host." };
     const prompt =
       (question && question.trim()) ||
       "Describe the image and note anything important.";
@@ -129,13 +171,16 @@ export const visionAnalyzeTool: Tool<
       { type: "input_image", image_url: imageUrl, detail: "auto" as const },
     ] as const;
 
-    const resp = await openai.responses.create({
-      model: "gpt-4o-mini",
-      input: [{ role: "user", content: parts as any }],
-    });
-
-    const answer = resp.output_text?.trim() || "No description available.";
-    return { answer };
+    try {
+      const resp = await openai.responses.create({
+        model: "gpt-4o-mini",
+        input: [{ role: "user", content: parts as any }],
+      });
+      const answer = resp.output_text?.trim() || "No description available.";
+      return { answer };
+    } catch {
+      return { answer: "Sorry — the vision iguana blinked. Try again in a moment." };
+    }
   },
 };
 
@@ -151,31 +196,30 @@ export const imageGenerateTool: Tool<
   input_schema: {
     type: "object",
     properties: {
-      prompt: { type: "string" },
+      prompt: { type: "string", minLength: 1 },
       size: { type: "string", enum: ["512x512", "1024x1024"] },
     },
     required: ["prompt"],
+    additionalProperties: false,
   },
   async execute({ prompt, size = "1024x1024" }) {
-    const r = await openai.images.generate({
-      model: "gpt-image-1",
-      prompt,
-      size,
-    });
-    const b64 = r.data?.[0]?.b64_json;
-    return { dataUrl: b64 ? `data:image/png;base64,${b64}` : undefined };
+    try {
+      const r = await openai.images.generate({
+        model: "gpt-image-1",
+        prompt,
+        size,
+      });
+      const b64 = r.data?.[0]?.b64_json;
+      return { dataUrl: b64 ? `data:image/png;base64,${b64}` : undefined };
+    } catch {
+      return { dataUrl: undefined };
+    }
   },
 };
 
 // ----------------------
 // Image (edit with optional mask)
 // ----------------------
-async function fetchAsBlob(url: string): Promise<Blob> {
-  const r = await fetch(url);
-  const ab = await r.arrayBuffer();
-  return new Blob([ab]);
-}
-
 export const imageEditTool: Tool<
   { imageUrl: string; prompt: string; maskUrl?: string; size?: "1024x1024" | "512x512" },
   { dataUrl?: string }
@@ -186,27 +230,35 @@ export const imageEditTool: Tool<
   input_schema: {
     type: "object",
     properties: {
-      imageUrl: { type: "string" },
-      prompt: { type: "string" },
+      imageUrl: { type: "string", minLength: 1 },
+      prompt: { type: "string", minLength: 1 },
       maskUrl: { type: "string" },
       size: { type: "string", enum: ["512x512", "1024x1024"] },
     },
     required: ["imageUrl", "prompt"],
+    additionalProperties: false,
   },
   async execute({ imageUrl, prompt, maskUrl, size = "1024x1024" }) {
-    const imageBlob = await fetchAsBlob(imageUrl);
-    const maskBlob = maskUrl ? await fetchAsBlob(maskUrl) : undefined;
+    try {
+      // if (!isAllowedImageUrl(imageUrl)) return { dataUrl: undefined };
+      // if (maskUrl && !isAllowedImageUrl(maskUrl)) return { dataUrl: undefined };
 
-    const r = await openai.images.edit({
-      model: "gpt-image-1",
-      prompt,
-      image: imageBlob as any, // Node 18+ Blob is acceptable to the SDK
-      ...(maskBlob ? { mask: maskBlob as any } : {}),
-      size,
-    });
+      const imageBlob = await fetchAsBlob(imageUrl);
+      const maskBlob = maskUrl ? await fetchAsBlob(maskUrl) : undefined;
 
-    const b64 = r.data?.[0]?.b64_json;
-    return { dataUrl: b64 ? `data:image/png;base64,${b64}` : undefined };
+      const r = await openai.images.edit({
+        model: "gpt-image-1",
+        prompt,
+        image: imageBlob as any, // Node 18+ Blob is OK for the SDK
+        ...(maskBlob ? { mask: maskBlob as any } : {}),
+        size,
+      });
+
+      const b64 = r.data?.[0]?.b64_json;
+      return { dataUrl: b64 ? `data:image/png;base64,${b64}` : undefined };
+    } catch {
+      return { dataUrl: undefined };
+    }
   },
 };
 

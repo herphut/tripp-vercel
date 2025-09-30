@@ -1,4 +1,5 @@
-import { db } from "@/db/db";
+import "server-only";
+import { db } from "@/app/api/_lib/db/db";
 import { sql } from "drizzle-orm";
 import { redactPII } from "@/lib/redact";
 

@@ -1,7 +1,7 @@
 // app/api/prefs/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { verifyJwtRS256 } from "@/lib/jwtVerify";
-import { readPrefs, writePrefs } from "@/src/lib/prefs";
+import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
+import { readPrefs, writePrefs } from "@/app/api/_lib/prefs";
 
 function unauth() {
   return NextResponse.json(

@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
@@ -17,14 +21,32 @@
     "baseUrl": ".",
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "@/*": ["./*", "./src/*"],
-      "@/lib/*": ["./lib/*", "./src/lib/*"],
-      "@/db/*": ["./db/*", "./src/db/*"]
+      "@/*": [
+        "./*",
+        "./src/*"
+      ],
+      "@/lib/*": [
+        "./lib/*",
+        "./src/lib/*"
+      ],
+      "@/db/*": [
+        "./db/*",
+        "app/api/_lib/db/*"
+      ]
     },
     "plugins": [
-      { "name": "next" }
+      {
+        "name": "next"
+      }
     ]
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "next-env.d.ts",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
 }

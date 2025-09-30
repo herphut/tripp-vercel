@@ -1,4 +1,5 @@
-// @/src/db/schema.ts
+// @/app/api/_lib/db/schema.ts
+import "server-only";
 import {
   pgSchema, pgTable,
   serial, bigserial, bigint,

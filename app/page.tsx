@@ -1,11 +1,60 @@
+// @/app/page.tsx
 'use client';
 
 import type { FormEvent, ChangeEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import Sidebar from '../components/Sidebar';
-import { getMemoryPref } from '@/src/lib/session'; // uses /api/prefs
 
 type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
+
+// ---------- tiny auth boot helpers ----------
+type ExchangeOK = {
+  session_id: string;
+  user_id: string | null;
+  guest?: boolean;
+  tier?: string;
+  expires_at: string;
+};
+
+type StatusOK = {
+  authenticated: boolean;
+  userId: string | null;
+  memoryOptIn: boolean;
+};
+
+async function exchange(): Promise<ExchangeOK> {
+  const r = await fetch('/api/auth/exchange', {
+    method: 'POST',
+    credentials: 'include',
+    cache: 'no-store',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+  // If JWT is invalid, server may still 401 with a refresh link
+  if (r.status === 401) {
+    const { refresh } = await r.json().catch(() => ({}));
+    if (refresh) window.location.href = refresh;
+    throw new Error('needs_refresh');
+  }
+  if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
+  return r.json();
+}
+
+async function fetchStatus(): Promise<StatusOK> {
+  const r = await fetch('/api/user/status', {
+    credentials: 'include',
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+  });
+  if (!r.ok) return { authenticated: false, userId: null, memoryOptIn: false };
+  const j = (await r.json()) as StatusOK;
+  return {
+    authenticated: !!j.authenticated,
+    userId: j.userId ?? null,
+    memoryOptIn: !!j.memoryOptIn,
+  };
+}
+// --------------------------------------------
 
 const LOCAL_HISTORY_LIMIT = 30;
 function buildRollingWindow(
@@ -15,24 +64,6 @@ function buildRollingWindow(
   const combined = [...local, { role: 'user' as const, content: newestUser }];
   return combined.slice(-LOCAL_HISTORY_LIMIT);
 }
-
-// ---------- tiny auth boot helpers ----------
-type ExchangeOK = { session_id: string; user_id: string; expires_at: string };
-async function exchange(): Promise<ExchangeOK> {
-  const r = await fetch('/api/auth/exchange', {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'content-type': 'application/json' },
-  });
-  if (r.status === 401) {
-    const { refresh } = await r.json().catch(() => ({}));
-    if (refresh) window.location.href = refresh;
-    throw new Error('needs refresh');
-  }
-  if (!r.ok) throw new Error(`exchange failed: ${r.status}`);
-  return r.json();
-}
-// --------------------------------------------
 
 function NewChatLink({ onClick, visible }: { onClick: () => void; visible: boolean }) {
   if (!visible) return null;
@@ -54,7 +85,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
 
-  // NEW: image upload state
+  // image upload state
   const [uploading, setUploading] = useState(false);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -120,20 +151,20 @@ export default function ChatPage() {
     };
   }, []);
 
-  // --------- BOOT: exchange + memory pref ----------
+  // --------- BOOT: exchange + status ----------
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const x = await exchange(); // sets HH_SESSION_ID cookie + returns ids
+        const x = await exchange(); // sets HH_SESSION_ID cookie server-side
         if (cancelled) return;
         setSessionId(x.session_id);
-        setUserId(x.user_id);
+        setUserId(x.user_id ?? null);
 
-        const on = await getMemoryPref();
+        const st = await fetchStatus();
         if (cancelled) return;
-        setMemoryEnabled(on);
-        localStorage.setItem('tripp:memoryOptIn', String(on));
+        setMemoryEnabled(!!st.memoryOptIn);
+        localStorage.setItem('tripp:memoryOptIn', String(!!st.memoryOptIn));
       } catch (e: any) {
         setBootErr(e?.message || 'boot failed');
       } finally {
@@ -144,19 +175,18 @@ export default function ChatPage() {
       cancelled = true;
     };
   }, []);
-  // -------------------------------------------------
+  // --------------------------------------------
 
   function handleNewChat() {
     setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
-    // same session; we can add a “new session” endpoint later if you want
   }
 
-  // NEW: open file picker
+  // open file picker
   function pickImage() {
     fileRef.current?.click();
   }
 
-  // NEW: upload to /api/upload
+  // upload to /api/upload
   async function onFileChange(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -169,16 +199,13 @@ export default function ChatPage() {
       const j = await r.json();
       setImageUrl(j.url || j.downloadUrl || null);
     } catch {
-      // show a small chat bubble error
       setMessages((m) => [...m, { role: 'assistant', content: 'Upload failed. Please try another image.' }]);
     } finally {
       setUploading(false);
-      // reset input so the same file can be picked again if needed
       if (fileRef.current) fileRef.current.value = '';
     }
   }
 
-  // NEW: remove selected image before sending
   function clearImage() {
     setImageUrl(null);
   }
@@ -193,7 +220,6 @@ export default function ChatPage() {
     }
 
     setInput('');
-    // Show optimistic user bubble; include a hint if there’s an image selected
     const optimisticText =
       imageUrl && text ? `${text}\n\n(Attached image: ${imageUrl})` :
       imageUrl ? `(Attached image: ${imageUrl})` : text;
@@ -203,20 +229,19 @@ export default function ChatPage() {
     setSending(true);
 
     try {
-      // Build payload depending on memory setting
       const payload =
         memoryEnabled
           ? {
               session_id: sessionId,
               user_id: userId,
               messages: [{ role: 'user', content: text || '(image attached)' }],
-              image_url: imageUrl || undefined, // <-- NEW: pass to server (future vision branch)
+              image_url: imageUrl || undefined,
             }
           : {
               session_id: sessionId,
               user_id: userId,
               messages: buildRollingWindow(
-                messages.map((m) => ({ role: m.role, content: m.content })), // local transcript
+                messages.map((m) => ({ role: m.role, content: m.content })),
                 optimisticText
               ),
               image_url: imageUrl || undefined,
@@ -247,7 +272,6 @@ export default function ChatPage() {
       ]);
     } finally {
       setSending(false);
-      // clear image after send
       setImageUrl(null);
     }
   }
@@ -312,7 +336,7 @@ export default function ChatPage() {
                 gap: 8,
               }}
             >
-              {/* NEW: hidden file input */}
+              {/* hidden file input */}
               <input
                 ref={fileRef}
                 type="file"
@@ -321,7 +345,7 @@ export default function ChatPage() {
                 onChange={onFileChange}
               />
 
-              {/* NEW: upload button (left of text input) */}
+              {/* upload button */}
               <button
                 type="button"
                 onClick={pickImage}
@@ -343,7 +367,7 @@ export default function ChatPage() {
                 {uploading ? '…' : '📷'}
               </button>
 
-              {/* NEW: tiny preview pill if image selected */}
+              {/* tiny preview pill */}
               {imageUrl && (
                 <span
                   style={{

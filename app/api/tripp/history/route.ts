@@ -1,9 +1,9 @@
 // app/api/history/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { db, schema } from "@/db/db";
+import { db, schema } from "@/app/api/_lib/db/db";
 import { asc, eq } from "drizzle-orm";
-import { verifyJwtRS256 } from "@/lib/jwtVerify";
-import { readPrefs } from "@/src/lib/prefs";
+import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
+import { readPrefs } from "@/app/api/_lib/prefs";
 import { auditLog } from "@/app/api/_lib/audit";
 
 async function userIdFromToken(req: NextRequest): Promise<string | null> {

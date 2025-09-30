@@ -1,3 +1,4 @@
+import "server-only";
 export type ClientType = "public_browser" | "server" | "admin";
 
 export const CLIENTS: Record<string, {

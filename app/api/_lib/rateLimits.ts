@@ -1,5 +1,5 @@
-// src/lib/rateLimits.ts
-
+// @/app/api/_lib/rateLimits.ts
+import "server-only";
 // ------- Types -------
 type Bucket = { count: number; resetAt: number };
 type Store = Map<string, Bucket>;

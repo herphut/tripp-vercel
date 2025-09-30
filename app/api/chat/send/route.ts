@@ -1,7 +1,7 @@
 // app/api/chat/send/route.ts (server)
 import { NextResponse } from "next/server";
-import { db } from "@/db/db";
-import { chatMessages } from "@/db/schema";
+import { db } from "@/app/api/_lib/db/db";
+import { chatMessages } from "@/app/api/_lib/db/schema";
 import { and, eq } from "drizzle-orm";
 
 export async function POST(req: Request) {

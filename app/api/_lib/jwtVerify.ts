@@ -1,4 +1,5 @@
 // lib/jwtVerify.ts
+import "server-only";
 import crypto from "crypto";
 
 type Jwk  = { kty: "RSA"; kid?: string; n?: string; e?: string; alg?: string; use?: string };

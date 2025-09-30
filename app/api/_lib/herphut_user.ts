@@ -1,4 +1,5 @@
 // app/api/_lib/herphut_user.ts
+import "server-only";
 import { cookies } from "next/headers";
 import { jwtVerify, type JWTPayload } from "jose";
 

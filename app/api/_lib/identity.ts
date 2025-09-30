@@ -1,6 +1,7 @@
 // app/api/_lib/identity.ts
+import "server-only";
 import { NextRequest } from "next/server";
-import { verifyJwtRS256 } from "@/lib/jwtVerify";
+import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
 
 export async function getIdentity(req: NextRequest): Promise<{
   user_id: string | null;

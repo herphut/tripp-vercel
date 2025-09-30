@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { db } from "@/src/db/db";         // adjust to your path
+import { db } from "@/app/api/_lib/db/db";         // adjust to your path
 import { sql as dsql } from "drizzle-orm";
 
 export async function GET() {

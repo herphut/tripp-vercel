@@ -1,6 +1,7 @@
-// src/lib/prefs.ts
-import { db } from "@/src/db/db";
-import { userPrefs } from "@/src/db/schema";
+// @/app/api/_lib/prefs.ts
+import "server-only";
+import { db } from "@/app/api/_lib/db/db";
+import { userPrefs } from "@/app/api/_lib/db/schema";
 import { eq } from "drizzle-orm";
 
 /**

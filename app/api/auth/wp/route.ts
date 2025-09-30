@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifyWPToken } from "@/lib/jwks";
+import { verifyWPToken } from "@/app/api/_lib/jwks";
 import { SignJWT } from "jose";
 
 export async function POST(req: NextRequest) {
