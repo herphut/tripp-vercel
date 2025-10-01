@@ -290,7 +290,24 @@ export default function ChatPage() {
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
-      <Sidebar headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />} />
+      <Sidebar
+  authed={!!userId}
+  memoryEnabled={memoryEnabled}
+  onToggleMemoryAction={(next) => setMemoryEnabled(next)}
+  onNewChatAction={async () => {
+    // start a fresh session (logged-in users will get a DB row; guests just a new id)
+    const r = await fetch('/api/sessions/new', { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => null);
+    if (j?.session_id) {
+      setSessionId(j.session_id);
+      setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
+    } else {
+      handleNewChat();
+    }
+  }}
+  headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
+/>
+
 
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'center' }}>

@@ -4,20 +4,8 @@ export const runtime = "nodejs";
 import "server-only";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/app/api/_lib/db";
-import { chatSessions } from "@/app/api/_lib/db/schema";
+import { chatSessions, userPrefs } from "@/app/api/_lib/db/schema";
 import { eq, and, sql } from "drizzle-orm";
-
-// If you already have a helper that returns memory opt-in for a user,
-// feel free to use it here. We'll import it softly (optional).
-let getMemoryPref: ((userId: string) => Promise<boolean>) | null = null;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = require("@/app/api/_lib/session");
-  if (typeof mod.getMemoryPref === "function") {
-    getMemoryPref = mod.getMemoryPref as (userId: string) => Promise<boolean>;
-  }
-  // eslint-disable-next-line no-empty
-} catch {}
 
 export async function GET(req: NextRequest) {
   try {
@@ -29,7 +17,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Find a non-revoked, non-expired session by session_id
+    // Look up session (non-revoked)
     const now = new Date();
     const rows = await db
       .select({
@@ -55,7 +43,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Expired session → treat as guest/unauthenticated
+    // Expired session => guest
     if (sess.expiresAt && new Date(sess.expiresAt) < now) {
       return NextResponse.json(
         { authenticated: false, userId: null, memoryOptIn: false },
@@ -65,21 +53,22 @@ export async function GET(req: NextRequest) {
 
     const isAuthed = !!sess.userId;
     if (!isAuthed) {
-      // guest session
+      // Guest session
       return NextResponse.json(
         { authenticated: false, userId: null, memoryOptIn: false },
         { headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // Authenticated: fetch memory preference if available
+    // Logged-in: read memory pref from Neon via Drizzle
     let memoryOptIn = false;
-    if (getMemoryPref) {
-      try {
-        memoryOptIn = !!(await getMemoryPref(String(sess.userId)));
-      } catch {
-        memoryOptIn = false;
-      }
+    try {
+      const pref = await db.query.userPrefs.findFirst({
+        where: eq(userPrefs.userId, String(sess.userId)),
+      });
+      memoryOptIn = !!pref?.memoryOptIn; // maps to DB column memory_opt_in
+    } catch {
+      memoryOptIn = false;
     }
 
     return NextResponse.json(
@@ -90,8 +79,8 @@ export async function GET(req: NextRequest) {
       },
       { headers: { "Cache-Control": "no-store" } }
     );
-  } catch (err) {
-    // On any error, default to unauthenticated but keep UI working
+  } catch {
+    // default safe response
     return NextResponse.json(
       { authenticated: false, userId: null, memoryOptIn: false },
       { headers: { "Cache-Control": "no-store" } }

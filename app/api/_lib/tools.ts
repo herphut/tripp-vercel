@@ -2,6 +2,7 @@
 import "server-only";
 import OpenAI from "openai";
 import type { NextRequest } from "next/server";
+import { put } from "@vercel/blob";
 
 // ----------------------
 // Shared Tool Interfaces
@@ -187,33 +188,47 @@ export const visionAnalyzeTool: Tool<
 // ----------------------
 // Image (generate)
 // ----------------------
+// ---------- Image (generate → returns public URL) ----------
 export const imageGenerateTool: Tool<
   { prompt: string; size?: "1024x1024" | "512x512" },
-  { dataUrl?: string }
+  { url?: string }
 > = {
   name: "image_generate",
-  description: "Generate an image from a text prompt. Returns a data URL (PNG).",
+  description:
+    "Generate an image from a text prompt. Returns a public URL to a PNG hosted on Vercel Blob.",
   input_schema: {
     type: "object",
     properties: {
-      prompt: { type: "string", minLength: 1 },
+      prompt: { type: "string" },
       size: { type: "string", enum: ["512x512", "1024x1024"] },
     },
     required: ["prompt"],
     additionalProperties: false,
   },
-  async execute({ prompt, size = "1024x1024" }) {
-    try {
-      const r = await openai.images.generate({
-        model: "gpt-image-1",
-        prompt,
-        size,
-      });
-      const b64 = r.data?.[0]?.b64_json;
-      return { dataUrl: b64 ? `data:image/png;base64,${b64}` : undefined };
-    } catch {
-      return { dataUrl: undefined };
-    }
+  async execute({ prompt, size = "1024x1024" }, ctx: { request: NextRequest }) {
+    // 1) Call Images API
+    const r = await openai.images.generate({
+      model: "gpt-image-1",
+      prompt,
+      size,
+    });
+    const b64 = r.data?.[0]?.b64_json;
+    if (!b64) return { url: undefined };
+
+    // 2) Convert to Blob
+    const buf = Buffer.from(b64, "base64");
+    const blob = new Blob([buf], { type: "image/png" });
+
+    // 3) Name + upload to Vercel Blob
+    // Optional: derive a user prefix if you pass one via headers later
+    const uid =
+      ctx.request.headers.get("x-hh-user-id") ??
+      ctx.request.headers.get("x-user-id") ??
+      "user";
+    const key = `gen/${uid}/${Date.now()}_image.png`;
+
+    const { url } = await put(key, blob, { access: "public" });
+    return { url };
   },
 };
 
@@ -262,12 +277,12 @@ export const imageEditTool: Tool<
   },
 };
 
-// ----------------------
-// Export Registry
-// ----------------------
+// ---------- Registry ----------
 export const trippTools = [
-  searchWebTool,
-  visionAnalyzeTool,
+  // You can leave other tools here if you want;
+  // but only "image_generate" will be exposed because of TRIPP_TOOL_ALLOW
   imageGenerateTool,
-  imageEditTool,
+  // searchWebTool,
+  // imageEditTool,
+  // visionAnalyzeTool, // (usually keep vision as inline multimodal, not a tool)
 ];
