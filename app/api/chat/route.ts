@@ -86,6 +86,14 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
+function wantsImageTool(text: string | undefined) {
+  if (!text) return false;
+  // Very conservative trigger words
+  return /(^|\b)(generate|make|create|draw|render|design)\b.*\b(image|picture|sticker|logo|icon|art)\b/i.test(text)
+      || /\b(image_generate|img:|#image)\b/i.test(text);
+}
+
+
 // Build Responses-API tool list dynamically per request
 function buildToolsForModel(opts: { isGuest: boolean }) {
   // global kill switch
@@ -332,8 +340,13 @@ export async function POST(req: NextRequest) {
 
     // ---------- TOOL CALLING LOOP ----------
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const toolsForModel = buildToolsForModel({ isGuest });
-    const maxToolHops = Math.max(0, Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1));
+    const toolsForModel =
+  buildToolsForModel({ isGuest }) &&
+  wantsImageTool(last?.content)
+    ? buildToolsForModel({ isGuest })    // expose tools only for image requests
+    : undefined;
+
+const maxToolHops = Math.max(0, Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1));
 
     // first call
     let resp: any;
@@ -356,11 +369,11 @@ export async function POST(req: NextRequest) {
         latency_ms: Date.now() - t0,
         error: msg,
       });
-      const expose = process.env.TRIPP_DEBUG === "1";
-      return NextResponse.json(
-        { error: "openai_unavailable", reason: expose ? msg : "model_error" },
-        { status: 502, headers: { "Cache-Control": "no-store" } }
-      );
+  const expose = process.env.TRIPP_DEBUG === "1";
+return NextResponse.json(
+  { error: "openai_unavailable", reason: expose ? msg : "model_error", detail: expose ? (err?.response?.data ?? err?.error ?? String(err)) : undefined },
+  { status: 502, headers: { "Cache-Control": "no-store" } }
+);
     }
 
     if (toolsForModel && maxToolHops > 0) {
