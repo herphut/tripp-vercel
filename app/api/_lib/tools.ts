@@ -186,9 +186,8 @@ export const visionAnalyzeTool: Tool<
 };
 
 // ----------------------
-// Image (generate)
+// Image (generate → returns public URL)
 // ----------------------
-// ---------- Image (generate → returns public URL) ----------
 export const imageGenerateTool: Tool<
   { prompt: string; size?: "1024x1024" | "512x512" },
   { url?: string }
@@ -199,14 +198,19 @@ export const imageGenerateTool: Tool<
   input_schema: {
     type: "object",
     properties: {
-      prompt: { type: "string" },
-      size: { type: "string", enum: ["512x512", "1024x1024"] },
+      prompt: { type: "string", minLength: 1, description: "Describe the image to generate." },
+      size: {
+        type: "string",
+        enum: ["512x512", "1024x1024"],
+        description: "Output image size.",
+        default: "1024x1024"
+      },
     },
-    required: ["prompt"],
+    // 🔧 Responses API (strict tools) requires listing *every key* here
+    required: ["prompt", "size"],
     additionalProperties: false,
   },
   async execute({ prompt, size = "1024x1024" }, ctx: { request: NextRequest }) {
-    // 1) Call Images API
     const r = await openai.images.generate({
       model: "gpt-image-1",
       prompt,
@@ -215,12 +219,10 @@ export const imageGenerateTool: Tool<
     const b64 = r.data?.[0]?.b64_json;
     if (!b64) return { url: undefined };
 
-    // 2) Convert to Blob
+    // Convert to Blob and upload to Vercel Blob (public)
     const buf = Buffer.from(b64, "base64");
     const blob = new Blob([buf], { type: "image/png" });
 
-    // 3) Name + upload to Vercel Blob
-    // Optional: derive a user prefix if you pass one via headers later
     const uid =
       ctx.request.headers.get("x-hh-user-id") ??
       ctx.request.headers.get("x-user-id") ??
