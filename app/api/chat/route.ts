@@ -7,7 +7,6 @@ import crypto from "crypto";
 import OpenAI from "openai";
 import { asc, eq, sql } from "drizzle-orm";
 
-// NOTE: adjust these import paths if your file layout differs
 import { db, schema } from "@/app/api/_lib/db/db";
 import { TRIPP_PROMPT } from "@/app/api/_lib/trippPrompt";
 import { getIdentity } from "@/app/api/_lib/identity";
@@ -15,7 +14,7 @@ import { auditLog } from "../_lib/audit";
 import { readPrefs } from "@/app/api/_lib/prefs";
 import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
 
-// ✅ tools + validator (paths assume you used my earlier placement)
+// tool registry + validator
 import { trippTools } from "@/app/api/_lib/tools";
 import {
   validateToolDefinitions,
@@ -26,21 +25,10 @@ import {
 const system = TRIPP_PROMPT;
 const HISTORY_LIMIT = 30;
 
-// Precompile tool validators once (at module load)
-const TOOL_DISABLED = process.env.TRIPP_DISABLE_TOOLS === "1";
-const TOOL_ALLOWLIST = (process.env.TRIPP_TOOL_ALLOW || "") // e.g. "vision_analyze,search_web"
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
+// Precompile tool definition validation once
 const toolValidators = validateToolDefinitions(trippTools);
-const allowedTools = trippTools.filter((t) =>
-  TOOL_ALLOWLIST.length ? TOOL_ALLOWLIST.includes(t.name) : true
-);
-const modelFunctions = TOOL_DISABLED
-  ? undefined
-  : toolsToFunctions(allowedTools); // Responses API "tools" payload
 
+// ---- types ----
 type TextTurn = { role: "system" | "user" | "assistant"; content: string };
 type VisionPart =
   | { type: "input_text"; text: string }
@@ -57,6 +45,7 @@ type Body = {
   image_url?: string;
 };
 
+// ---- helpers ----
 function makeTitleFrom(text: string): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
   const firstStop = cleaned.search(/[.!?]/);
@@ -97,19 +86,54 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
+// Build Responses-API tool list dynamically per request
+function buildToolsForModel(opts: { isGuest: boolean }) {
+  // global kill switch
+  if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
+
+  // Guests: no tools
+  if (opts.isGuest) return undefined;
+
+  if (!Array.isArray(trippTools) || trippTools.length === 0) return undefined;
+
+  // Whitelist e.g. TRIPP_ALLOWED_TOOLS=image_generate,search_web
+  const allowEnv = (process.env.TRIPP_ALLOWED_TOOLS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const allow = new Set(allowEnv);
+
+  // If whitelist empty → expose nothing (safe)
+  if (allow.size === 0) return undefined;
+
+  const filtered = trippTools
+    .filter((t) => t && typeof t.name === "string" && t.name.trim())
+    .filter((t) => allow.has(t.name.toLowerCase()));
+
+  if (!filtered.length) return undefined;
+
+  return toolsToFunctions(
+    filtered.map((t) => ({
+      ...t,
+      input_schema:
+        t.input_schema && typeof t.input_schema === "object"
+          ? t.input_schema
+          : { type: "object", properties: {} },
+    }))
+  );
+}
+
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
   const { client_id, user_id: identityUserId } = await getIdentity(req);
   const clientId = client_id ?? "webchat";
+  const isGuest = !identityUserId;
 
   // soft session id fallback for dev
   const softSessionId =
     req.cookies.get("SESSION_ID")?.value ||
     req.cookies.get("ANON_SESSION_ID")?.value ||
     null;
-
-  
-  const isGuest = !identityUserId;
 
   try {
     const body = (await req.json()) as Body;
@@ -222,12 +246,9 @@ export async function POST(req: NextRequest) {
       if (needLast) modelMessages.push({ role: "user", content: last.content });
     }
 
-    // compute isGuest from your identity (you already have identityUserId)
-    const isGuest = !identityUserId;
-
-    // If an image was attached, append a multimodal user turn and log attachment
+    // If an image was attached AND user is logged in, add multimodal turn + log attachment
     const imageUrl = body?.image_url;
-  if (imageUrl && !isGuest) {
+    if (imageUrl && !isGuest) {
       const visionPrompt =
         (typeof last?.content === "string" && last.content.trim()) ||
         "Please describe this image and note anything important.";
@@ -240,7 +261,6 @@ export async function POST(req: NextRequest) {
         ],
       });
 
-      // record attachment (best-effort)
       try {
         await db.insert(schema.attachments).values({
           sessionId,
@@ -301,7 +321,7 @@ export async function POST(req: NextRequest) {
           messages: messagesOut,
           diag: {
             openai_used: false,
-            tools_enabled: !!modelFunctions,
+            tools_enabled: false,
             persisted: persist,
             memory_scope: identityUserId ? "user" : "session",
           },
@@ -312,7 +332,8 @@ export async function POST(req: NextRequest) {
 
     // ---------- TOOL CALLING LOOP ----------
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const toolsForModel = modelFunctions;
+    const toolsForModel = buildToolsForModel({ isGuest });
+    const maxToolHops = Math.max(0, Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1));
 
     // first call
     let resp: any;
@@ -342,9 +363,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (toolsForModel) {
-      for (let i = 0; i < 2; i++) {
-        // collect tool calls from the Responses API structure
+    if (toolsForModel && maxToolHops > 0) {
+      for (let i = 0; i < maxToolHops; i++) {
+        // collect tool calls
         const toolUses: Array<{ id: string; name: string; input: any }> = [];
         for (const out of (resp as any).output ?? []) {
           for (const part of out?.content ?? []) {
@@ -355,9 +376,8 @@ export async function POST(req: NextRequest) {
         }
         if (toolUses.length === 0) break;
 
-        // execute tools (with validation) and append tool_result
+        // execute tools (with arg validation) and append tool_result
         for (const tu of toolUses) {
-          // validate args against schema
           const inv = validateInvocation(toolValidators, tu.name, tu.input);
           if (!inv.ok) {
             (modelMessages as any[]).push({
@@ -425,11 +445,7 @@ export async function POST(req: NextRequest) {
           });
 
           return NextResponse.json(
-            {
-              error: "openai_unavailable",
-              reason: "model_error",
-              detail: apiMsg,
-            },
+            { error: "openai_unavailable", reason: "model_error", detail: apiMsg },
             { status: 502, headers: { "Cache-Control": "no-store" } }
           );
         }
@@ -498,7 +514,7 @@ export async function POST(req: NextRequest) {
         messages,
         diag: {
           openai_used: true,
-          tools_enabled: !!modelFunctions,
+          tools_enabled: !!buildToolsForModel({ isGuest }),
           persisted: persist,
           memory_scope: identityUserId ? "user" : "session",
         },
@@ -519,7 +535,10 @@ export async function POST(req: NextRequest) {
       { error: "chat_route_failed", detail: "internal_error" },
       {
         status: 500,
-        headers: { "content-type": "application/json", "Cache-Control": "no-store" },
+        headers: {
+          "content-type": "application/json",
+          "Cache-Control": "no-store",
+        },
       }
     );
   }
