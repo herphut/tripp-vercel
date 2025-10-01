@@ -206,6 +206,9 @@ export const imageGenerateTool: Tool<
         default: "1024x1024"
       },
     },
+
+
+
     // 🔧 Responses API (strict tools) requires listing *every key* here
     required: ["prompt", "size"],
     additionalProperties: false,

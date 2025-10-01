@@ -19,7 +19,6 @@ import { trippTools } from "@/app/api/_lib/tools";
 import {
   validateToolDefinitions,
   validateInvocation,
-  toolsToFunctions,
 } from "@/app/api/_lib/toolvalidator";
 
 const system = TRIPP_PROMPT;
@@ -93,26 +92,19 @@ function wantsImageTool(text: string | undefined) {
       || /\b(image_generate|img:|#image)\b/i.test(text);
 }
 
-
-// Build Responses-API tool list dynamically per request
+// Build Responses-API tool list dynamically per request (no schema rewrite)
 function buildToolsForModel(opts: { isGuest: boolean }) {
-  // global kill switch
   if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
-
-  // Guests: no tools
-  if (opts.isGuest) return undefined;
-
+  if (opts.isGuest) return undefined; // guests: no tools
   if (!Array.isArray(trippTools) || trippTools.length === 0) return undefined;
 
-  // Whitelist e.g. TRIPP_ALLOWED_TOOLS=image_generate,search_web
   const allowEnv = (process.env.TRIPP_ALLOWED_TOOLS || "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
-  const allow = new Set(allowEnv);
+  if (allowEnv.length === 0) return undefined; // empty allowlist = expose nothing
 
-  // If whitelist empty → expose nothing (safe)
-  if (allow.size === 0) return undefined;
+  const allow = new Set(allowEnv);
 
   const filtered = trippTools
     .filter((t) => t && typeof t.name === "string" && t.name.trim())
@@ -120,15 +112,14 @@ function buildToolsForModel(opts: { isGuest: boolean }) {
 
   if (!filtered.length) return undefined;
 
-  return toolsToFunctions(
-    filtered.map((t) => ({
-      ...t,
-      input_schema:
-        t.input_schema && typeof t.input_schema === "object"
-          ? t.input_schema
-          : { type: "object", properties: {} },
-    }))
-  );
+  // IMPORTANT: pass the tool's input_schema through as-is
+  return filtered.map((t) => ({
+    type: "function" as const,
+    name: t.name,
+    description: t.description ?? "",
+    parameters: t.input_schema ?? { type: "object", properties: {}, required: [] },
+    strict: true,
+  }));
 }
 
 export async function POST(req: NextRequest) {
