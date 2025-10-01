@@ -97,6 +97,11 @@ export default function ChatPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [memoryEnabled, setMemoryEnabled] = useState(false);
 
+  
+   // derive auth + upload rights
+  const authed = !!userId;
+  const canUploadImages = authed;
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll
@@ -188,6 +193,7 @@ export default function ChatPage() {
 
   // upload to /api/upload
   async function onFileChange(e: ChangeEvent<HTMLInputElement>) {
+    if (!canUploadImages) return;
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
@@ -235,7 +241,8 @@ export default function ChatPage() {
               session_id: sessionId,
               user_id: userId,
               messages: [{ role: 'user', content: text || '(image attached)' }],
-              image_url: imageUrl || undefined,
+              image_url: canUploadImages ? (imageUrl || undefined) : undefined,
+
             }
           : {
               session_id: sessionId,
@@ -244,7 +251,8 @@ export default function ChatPage() {
                 messages.map((m) => ({ role: m.role, content: m.content })),
                 optimisticText
               ),
-              image_url: imageUrl || undefined,
+              image_url: canUploadImages ? (imageUrl || undefined) : undefined,
+
             };
 
       const res = await fetch('/api/chat', {
@@ -325,143 +333,155 @@ export default function ChatPage() {
             </div>
 
             <form
-              onSubmit={onSubmit}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                border: '1px solid #444',
-                borderRadius: '9999px',
-                padding: '4px 8px',
-                background: '#1a1c1f',
-                gap: 8,
-              }}
-            >
-              {/* hidden file input */}
-              <input
-                ref={fileRef}
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif"
-                style={{ display: 'none' }}
-                onChange={onFileChange}
-              />
+  onSubmit={onSubmit}
+  style={{
+    display: 'flex',
+    alignItems: 'center',
+    border: '1px solid #444',
+    borderRadius: '9999px',
+    padding: '4px 8px',
+    background: '#1a1c1f',
+    gap: 8,
+  }}
+>
+  {/* Hidden file input (only render if allowed) */}
+  {canUploadImages && (
+    <input
+      ref={fileRef}
+      type="file"
+      accept="image/png,image/jpeg,image/webp,image/gif"
+      style={{ display: 'none' }}
+      onChange={onFileChange}
+    />
+  )}
 
-              {/* upload button */}
-              <button
-                type="button"
-                onClick={pickImage}
-                disabled={sending || uploading}
-                title={uploading ? 'Uploading…' : 'Upload image'}
-                style={{
-                  width: 36,
-                  height: 36,
-                  borderRadius: '50%',
-                  border: '1px solid rgba(255,255,255,0.35)',
-                  background: 'transparent',
-                  color: '#fff',
-                  display: 'grid',
-                  placeItems: 'center',
-                  opacity: sending ? 0.6 : 1,
-                  cursor: sending ? 'not-allowed' : 'pointer',
-                }}
-              >
-                {uploading ? '…' : '📷'}
-              </button>
+  {/* Upload button (only render if allowed) */}
+  {canUploadImages && (
+    <button
+      type="button"
+      onClick={pickImage}
+      disabled={sending || uploading}
+      title={uploading ? 'Uploading…' : 'Upload image'}
+      style={{
+        width: 36,
+        height: 36,
+        borderRadius: '50%',
+        border: '1px solid rgba(255,255,255,0.35)',
+        background: 'transparent',
+        color: '#fff',
+        display: 'grid',
+        placeItems: 'center',
+        opacity: sending ? 0.6 : 1,
+        cursor: sending ? 'not-allowed' : 'pointer',
+      }}
+    >
+      {uploading ? '…' : '📷'}
+    </button>
+  )}
 
-              {/* tiny preview pill */}
-              {imageUrl && (
-                <span
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 6,
-                    background: '#262a2f',
-                    border: '1px solid #3a3f46',
-                    borderRadius: 999,
-                    padding: '3px 8px',
-                    maxWidth: 220,
-                  }}
-                  title={imageUrl}
-                >
-                  <img
-                    src={imageUrl}
-                    alt="preview"
-                    style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 6 }}
-                  />
-                  <span style={{ fontSize: 12, opacity: 0.8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    image attached
-                  </span>
-                  <button
-                    type="button"
-                    onClick={clearImage}
-                    aria-label="Remove image"
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      color: '#aaa',
-                      cursor: 'pointer',
-                      fontSize: 14,
-                    }}
-                  >
-                    ×
-                  </button>
-                </span>
-              )}
+  {/* tiny preview pill (only if allowed and present) */}
+  {canUploadImages && imageUrl && (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        background: '#262a2f',
+        border: '1px solid #3a3f46',
+        borderRadius: 999,
+        padding: '3px 8px',
+        maxWidth: 220,
+      }}
+      title={imageUrl}
+    >
+      <img
+        src={imageUrl}
+        alt="preview"
+        style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 6 }}
+      />
+      <span
+        style={{
+          fontSize: 12,
+          opacity: 0.8,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        image attached
+      </span>
+      <button
+        type="button"
+        onClick={clearImage}
+        aria-label="Remove image"
+        style={{
+          background: 'transparent',
+          border: 'none',
+          color: '#aaa',
+          cursor: 'pointer',
+          fontSize: 14,
+        }}
+      >
+        ×
+      </button>
+    </span>
+  )}
 
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
-                disabled={sending}
-                style={{
-                  flex: 1,
-                  border: 'none',
-                  outline: 'none',
-                  background: 'transparent',
-                  color: '#fff',
-                  padding: '8px',
-                }}
-              />
+  <input
+    type="text"
+    value={input}
+    onChange={(e) => setInput(e.target.value)}
+    placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
+    disabled={sending}
+    style={{
+      flex: 1,
+      border: 'none',
+      outline: 'none',
+      background: 'transparent',
+      color: '#fff',
+      padding: '8px',
+    }}
+  />
 
-              <button
-                type="submit"
-                disabled={sending}
-                style={{
-                  width: 44,
-                  height: 44,
-                  borderRadius: '50%',
-                  border: '1px solid rgba(255,255,255,0.35)',
-                  background: 'linear-gradient(180deg, #34d399, #16a34a)',
-                  display: 'grid',
-                  placeItems: 'center',
-                  padding: 0,
-                  margin: 0,
-                  cursor: sending ? 'not-allowed' : 'pointer',
-                  transition: 'box-shadow 0.2s ease, transform 0.05s ease',
-                }}
-                onMouseEnter={(e) => {
-                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-                  if (img) img.style.transform = 'scale(1.18)';
-                  (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 0 10px #22c55e';
-                }}
-                onMouseLeave={(e) => {
-                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-                  if (img) img.style.transform = 'scale(1)';
-                  (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
-                }}
-                onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
-                onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}
-              >
-                <img
-                  src="/lizard.svg"
-                  alt="Send"
-                  style={{ width: 30, height: 30, display: 'block', transition: 'transform 0.2s ease' }}
-                />
-              </button>
-            </form>
-          </div>
-        </div>
-      </main>
-    </div>
-  );
+  <button
+    type="submit"
+    disabled={sending}
+    style={{
+      width: 44,
+      height: 44,
+      borderRadius: '50%',
+      border: '1px solid rgba(255,255,255,0.35)',
+      background: 'linear-gradient(180deg, #34d399, #16a34a)',
+      display: 'grid',
+      placeItems: 'center',
+      padding: 0,
+      margin: 0,
+      cursor: sending ? 'not-allowed' : 'pointer',
+      transition: 'box-shadow 0.2s ease, transform 0.05s ease',
+    }}
+    onMouseEnter={(e) => {
+      const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+      if (img) img.style.transform = 'scale(1.18)';
+      (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 0 10px #22c55e';
+    }}
+    onMouseLeave={(e) => {
+      const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+      if (img) img.style.transform = 'scale(1)';
+      (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
+    }}
+    onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
+    onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}
+  >
+    <img
+      src="/lizard.svg"
+      alt="Send"
+      style={{ width: 30, height: 30, display: 'block', transition: 'transform 0.2s ease' }}
+    />
+  </button>
+</form>
+</div>
+</div>
+</main>
+</div>
+);
 }

@@ -108,6 +108,9 @@ export async function POST(req: NextRequest) {
     req.cookies.get("ANON_SESSION_ID")?.value ||
     null;
 
+  
+  const isGuest = !identityUserId;
+
   try {
     const body = (await req.json()) as Body;
     const sessionId = body?.session_id || softSessionId || crypto.randomUUID();
@@ -219,9 +222,12 @@ export async function POST(req: NextRequest) {
       if (needLast) modelMessages.push({ role: "user", content: last.content });
     }
 
+    // compute isGuest from your identity (you already have identityUserId)
+    const isGuest = !identityUserId;
+
     // If an image was attached, append a multimodal user turn and log attachment
     const imageUrl = body?.image_url;
-    if (imageUrl) {
+  if (imageUrl && !isGuest) {
       const visionPrompt =
         (typeof last?.content === "string" && last.content.trim()) ||
         "Please describe this image and note anything important.";
