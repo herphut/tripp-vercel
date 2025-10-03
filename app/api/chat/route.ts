@@ -35,31 +35,6 @@ type Body = {
 };
 
 // ---- helpers ----
-
-function extractImageBase64s(resp: any): string[] {
-  const out: string[] = [];
-  if (!resp) return out;
-
-  // The Responses payload can surface images either as top-level generation calls
-  // or as assistant message content blocks. We check both shapes.
-  for (const item of resp.output ?? []) {
-    // Case A: built-in tool call surfaced directly
-    if (item?.type === "image_generation_call" && item?.result) {
-      out.push(String(item.result));
-    }
-    // Case B: assistant message blocks
-    for (const part of item?.content ?? []) {
-      const maybe =
-        part?.image_base64 ?? part?.base64 ?? part?.data ?? part?.result ?? null;
-      if (typeof maybe === "string" && maybe.length > 1000) out.push(maybe);
-    }
-  }
-
-  // de-dup
-  return Array.from(new Set(out));
-}
-
-
 function makeTitleFrom(text: string): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
   const firstStop = cleaned.search(/[.!?]/);
@@ -110,27 +85,11 @@ function wantsImageTool(text: string | undefined) {
   );
 }
 
-// ---- built-in tools allowlist (env: TRIPP_BUILTIN_TOOLS=image_generation,web_search) ----
-function builtInToolsForRequest(opts: { isGuest: boolean; lastUserText: string | undefined }) {
-  if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
-  if (opts.isGuest) return undefined; // never expose tools to guests
-
-  // parse allowlist
-  const allowEnv = (process.env.TRIPP_BUILTIN_TOOLS || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowEnv.length === 0) return undefined;
-
-  // Only expose image generation when user actually asks for an image
-  const tools: any[] = [];
-  if (allowEnv.includes("image_generation") && wantsImageTool(opts.lastUserText)) {
-    tools.push({ type: "image_generation" as const });
-  }
-
-  // (Later you can add: if (allowEnv.includes("web_search")) tools.push({ type: "web_search" as const }); )
-
-  return tools.length ? tools : undefined;
+// Extract a requested size if the user says “512x512”, else default 1024x1024
+function parseRequestedSize(text: string | undefined): "512x512" | "1024x1024" {
+  if (!text) return "1024x1024";
+  const m = text.match(/\b(512x512|1024x1024)\b/i);
+  return (m?.[1]?.toLowerCase() as any) || "1024x1024";
 }
 
 export async function POST(req: NextRequest) {
@@ -340,77 +299,81 @@ export async function POST(req: NextRequest) {
       );
     }
 
-   // ---------- Built-in tools path ----------
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    // ---------- Model call (images if asked, otherwise Responses) ----------
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-const toolsForModel = builtInToolsForRequest({
-  isGuest,
-  lastUserText: last?.content,
-});
+    let resp: any = null;
+    let assistantText: string | null = null;
 
-const askedForImage =
-  !!toolsForModel?.some((t: any) => t?.type === "image_generation");
+    if (!isGuest && wantsImageTool(last?.content)) {
+      // Direct Images API (Responses API does NOT support gpt-image-1)
+      try {
+        const size = parseRequestedSize(last?.content);
+        const img = await openai.images.generate({
+          model: "gpt-image-1",
+          prompt: last.content,
+          size,
+        });
 
-// choose model: use gpt-image-1 when asking to generate an image
-const modelName = askedForImage
-  ? "gpt-image-1"
-  : (imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini");
-
-const maxToolHops = Math.max(
-  0,
-  Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1)
-);
-
-// first call
-let resp: any;
-try {
-  resp = await openai.responses.create({
-    model: modelName,
-    input: modelMessages as any,
-    ...(toolsForModel
-      ? { tools: toolsForModel as any, tool_choice: "auto" as const }
-      : {}),
-  });
-} catch (err: any) {
-  const msg = `openai_create_failed: ${String(err?.message || err)}`;
-  await auditLog({
-    route: "/api/chat:POST",
-    status: 502,
-    client_id: clientId,
-    user_id: identityUserId,
-    session_id: sessionId,
-    latency_ms: Date.now() - t0,
-    error: msg,
-  });
-  const expose = process.env.TRIPP_DEBUG === "1";
-  return NextResponse.json(
-    {
-      error: "openai_unavailable",
-      reason: expose ? msg : "model_error",
-      detail: expose
-        ? (err?.response?.data ?? err?.error ?? String(err))
-        : undefined,
-    },
-    { status: 502, headers: { "Cache-Control": "no-store" } }
-  );
-}
-
-    // ---------- end built-in tools path ----------
-
-    let assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
-
-if (askedForImage) {
-  const b64s = extractImageBase64s(resp);
-  if (b64s.length) {
-    const dataUrl = `data:image/png;base64,${b64s[0]}`;
-    // Keep it simple for now: return the data URL in the assistant text.
-    assistantText = `Here’s your image (data URL below). Copy to a new tab to view or save:\n\n${dataUrl}`;
-  }
-}
-
+        const b64 = img.data?.[0]?.b64_json;
+        if (b64 && typeof b64 === "string") {
+          assistantText = `Here is your image:\n\ndata:image/png;base64,${b64}`;
+        } else {
+          assistantText =
+            "I tried to generate an image but didn’t receive data back. Please try again.";
+        }
+      } catch (err: any) {
+        const msg = err?.response?.data?.error?.message || err?.message || String(err);
+        await auditLog({
+          route: "/api/chat:POST",
+          status: 502,
+          client_id: clientId,
+          user_id: identityUserId,
+          session_id: sessionId,
+          latency_ms: Date.now() - t0,
+          error: `images_api_error: ${msg}`,
+        });
+        return NextResponse.json(
+          { error: "openai_unavailable", reason: "images_api_error", detail: msg },
+          { status: 502, headers: { "Cache-Control": "no-store" } }
+        );
+      }
+    } else {
+      // Normal chat path via Responses API
+      try {
+        resp = await openai.responses.create({
+          model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
+          input: modelMessages as any,
+        });
+        assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+      } catch (err: any) {
+        const msg = `openai_create_failed: ${String(err?.message || err)}`;
+        await auditLog({
+          route: "/api/chat:POST",
+          status: 502,
+          client_id: clientId,
+          user_id: identityUserId,
+          session_id: sessionId,
+          latency_ms: Date.now() - t0,
+          error: msg,
+        });
+        const expose = process.env.TRIPP_DEBUG === "1";
+        return NextResponse.json(
+          {
+            error: "openai_unavailable",
+            reason: expose ? msg : "model_error",
+            detail: expose
+              ? (err?.response?.data ?? err?.error ?? String(err))
+              : undefined,
+          },
+          { status: 502, headers: { "Cache-Control": "no-store" } }
+        );
+      }
+    }
+    // ---------- end model call ----------
 
     // persist assistant turn if memory on
-    if (persist) {
+    if (persist && assistantText) {
       try {
         await db.insert(schema.chatMessages).values({
           sessionId,
@@ -449,7 +412,7 @@ if (askedForImage) {
               })),
             {
               role: "assistant",
-              content: assistantText,
+              content: assistantText ?? "Sorry, I came up empty.",
               created_at: new Date().toISOString(),
             },
           ];
@@ -468,7 +431,7 @@ if (askedForImage) {
         messages,
         diag: {
           openai_used: true,
-          tools_enabled: !!toolsForModel,
+          tools_enabled: false, // we’re not exposing custom tools in this route
           persisted: persist,
           memory_scope: identityUserId ? "user" : "session",
         },
