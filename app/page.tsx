@@ -78,6 +78,53 @@ function NewChatLink({ onClick, visible }: { onClick: () => void; visible: boole
   );
 }
 
+// Renders message content and shows images if a data URL or image link is present
+function renderMessageContent(text: string) {
+  const trimmed = text.trim();
+
+  // pure data URL
+  if (/^data:image\/[a-zA-Z]+;base64,/.test(trimmed)) {
+    return (
+      <img
+        src={trimmed}
+        alt="image"
+        style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+      />
+    );
+  }
+
+  // data URL embedded inside longer text
+  const dataMatch = trimmed.match(/data:image\/[a-zA-Z]+;base64,[A-Za-z0-9+/=]+/);
+  if (dataMatch) {
+    const before = trimmed.slice(0, dataMatch.index).trim();
+    const after = trimmed.slice((dataMatch.index ?? 0) + dataMatch[0].length).trim();
+    return (
+      <>
+        {before && <div style={{ marginBottom: 6, whiteSpace: 'pre-wrap' }}>{before}</div>}
+        <img
+          src={dataMatch[0]}
+          alt="image"
+          style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+        />
+        {after && <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{after}</div>}
+      </>
+    );
+  }
+
+  // plain http(s) image URL (very simple heuristic)
+  if (/^https?:\/\/\S+\.(png|jpg|jpeg|webp|gif)(\?\S+|#\S+)?$/i.test(trimmed)) {
+    return (
+      <img
+        src={trimmed}
+        alt="image"
+        style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+      />
+    );
+  }
+
+  return <>{text}</>;
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<LocalChatMessage[]>([
     { role: 'assistant', content: "Hi! I'm Tripp. You're chatting with the new HerpHut AI. How can I help today?" },
@@ -97,8 +144,7 @@ export default function ChatPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [memoryEnabled, setMemoryEnabled] = useState(false);
 
-  
-   // derive auth + upload rights
+  // derive auth + upload rights
   const authed = !!userId;
   const canUploadImages = authed;
 
@@ -242,7 +288,6 @@ export default function ChatPage() {
               user_id: userId,
               messages: [{ role: 'user', content: text || '(image attached)' }],
               image_url: canUploadImages ? (imageUrl || undefined) : undefined,
-
             }
           : {
               session_id: sessionId,
@@ -252,7 +297,6 @@ export default function ChatPage() {
                 optimisticText
               ),
               image_url: canUploadImages ? (imageUrl || undefined) : undefined,
-
             };
 
       const res = await fetch('/api/chat', {
@@ -291,23 +335,22 @@ export default function ChatPage() {
   return (
     <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
       <Sidebar
-  authed={!!userId}
-  memoryEnabled={memoryEnabled}
-  onToggleMemoryAction={(next) => setMemoryEnabled(next)}
-  onNewChatAction={async () => {
-    // start a fresh session (logged-in users will get a DB row; guests just a new id)
-    const r = await fetch('/api/sessions/new', { method: 'POST', credentials: 'include' });
-    const j = await r.json().catch(() => null);
-    if (j?.session_id) {
-      setSessionId(j.session_id);
-      setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
-    } else {
-      handleNewChat();
-    }
-  }}
-  headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
-/>
-
+        authed={!!userId}
+        memoryEnabled={memoryEnabled}
+        onToggleMemoryAction={(next) => setMemoryEnabled(next)}
+        onNewChatAction={async () => {
+          // start a fresh session (logged-in users will get a DB row; guests just a new id)
+          const r = await fetch('/api/sessions/new', { method: 'POST', credentials: 'include' });
+          const j = await r.json().catch(() => null);
+          if (j?.session_id) {
+            setSessionId(j.session_id);
+            setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
+          } else {
+            handleNewChat();
+          }
+        }}
+        headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
+      />
 
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'center' }}>
@@ -343,162 +386,162 @@ export default function ChatPage() {
                       whiteSpace: 'pre-wrap',
                     }}
                   >
-                    {m.content}
+                    {renderMessageContent(m.content)}
                   </div>
                 </div>
               ))}
             </div>
 
             <form
-  onSubmit={onSubmit}
-  style={{
-    display: 'flex',
-    alignItems: 'center',
-    border: '1px solid #444',
-    borderRadius: '9999px',
-    padding: '4px 8px',
-    background: '#1a1c1f',
-    gap: 8,
-  }}
->
-  {/* Hidden file input (only render if allowed) */}
-  {canUploadImages && (
-    <input
-      ref={fileRef}
-      type="file"
-      accept="image/png,image/jpeg,image/webp,image/gif"
-      style={{ display: 'none' }}
-      onChange={onFileChange}
-    />
-  )}
+              onSubmit={onSubmit}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                border: '1px solid #444',
+                borderRadius: '9999px',
+                padding: '4px 8px',
+                background: '#1a1c1f',
+                gap: 8,
+              }}
+            >
+              {/* Hidden file input (only render if allowed) */}
+              {canUploadImages && (
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  style={{ display: 'none' }}
+                  onChange={onFileChange}
+                />
+              )}
 
-  {/* Upload button (only render if allowed) */}
-  {canUploadImages && (
-    <button
-      type="button"
-      onClick={pickImage}
-      disabled={sending || uploading}
-      title={uploading ? 'Uploading…' : 'Upload image'}
-      style={{
-        width: 36,
-        height: 36,
-        borderRadius: '50%',
-        border: '1px solid rgba(255,255,255,0.35)',
-        background: 'transparent',
-        color: '#fff',
-        display: 'grid',
-        placeItems: 'center',
-        opacity: sending ? 0.6 : 1,
-        cursor: sending ? 'not-allowed' : 'pointer',
-      }}
-    >
-      {uploading ? '…' : '📷'}
-    </button>
-  )}
+              {/* Upload button (only render if allowed) */}
+              {canUploadImages && (
+                <button
+                  type="button"
+                  onClick={pickImage}
+                  disabled={sending || uploading}
+                  title={uploading ? 'Uploading…' : 'Upload image'}
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: '50%',
+                    border: '1px solid rgba(255,255,255,0.35)',
+                    background: 'transparent',
+                    color: '#fff',
+                    display: 'grid',
+                    placeItems: 'center',
+                    opacity: sending ? 0.6 : 1,
+                    cursor: sending ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {uploading ? '…' : '📷'}
+                </button>
+              )}
 
-  {/* tiny preview pill (only if allowed and present) */}
-  {canUploadImages && imageUrl && (
-    <span
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 6,
-        background: '#262a2f',
-        border: '1px solid #3a3f46',
-        borderRadius: 999,
-        padding: '3px 8px',
-        maxWidth: 220,
-      }}
-      title={imageUrl}
-    >
-      <img
-        src={imageUrl}
-        alt="preview"
-        style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 6 }}
-      />
-      <span
-        style={{
-          fontSize: 12,
-          opacity: 0.8,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        image attached
-      </span>
-      <button
-        type="button"
-        onClick={clearImage}
-        aria-label="Remove image"
-        style={{
-          background: 'transparent',
-          border: 'none',
-          color: '#aaa',
-          cursor: 'pointer',
-          fontSize: 14,
-        }}
-      >
-        ×
-      </button>
-    </span>
-  )}
+              {/* tiny preview pill (only if allowed and present) */}
+              {canUploadImages && imageUrl && (
+                <span
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    background: '#262a2f',
+                    border: '1px solid #3a3f46',
+                    borderRadius: 999,
+                    padding: '3px 8px',
+                    maxWidth: 220,
+                  }}
+                  title={imageUrl}
+                >
+                  <img
+                    src={imageUrl}
+                    alt="preview"
+                    style={{ width: 24, height: 24, objectFit: 'cover', borderRadius: 6 }}
+                  />
+                  <span
+                    style={{
+                      fontSize: 12,
+                      opacity: 0.8,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    image attached
+                  </span>
+                  <button
+                    type="button"
+                    onClick={clearImage}
+                    aria-label="Remove image"
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#aaa',
+                      cursor: 'pointer',
+                      fontSize: 14,
+                    }}
+                  >
+                    ×
+                  </button>
+                </span>
+              )}
 
-  <input
-    type="text"
-    value={input}
-    onChange={(e) => setInput(e.target.value)}
-    placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
-    disabled={sending}
-    style={{
-      flex: 1,
-      border: 'none',
-      outline: 'none',
-      background: 'transparent',
-      color: '#fff',
-      padding: '8px',
-    }}
-  />
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
+                disabled={sending}
+                style={{
+                  flex: 1,
+                  border: 'none',
+                  outline: 'none',
+                  background: 'transparent',
+                  color: '#fff',
+                  padding: '8px',
+                }}
+              />
 
-  <button
-    type="submit"
-    disabled={sending}
-    style={{
-      width: 44,
-      height: 44,
-      borderRadius: '50%',
-      border: '1px solid rgba(255,255,255,0.35)',
-      background: 'linear-gradient(180deg, #34d399, #16a34a)',
-      display: 'grid',
-      placeItems: 'center',
-      padding: 0,
-      margin: 0,
-      cursor: sending ? 'not-allowed' : 'pointer',
-      transition: 'box-shadow 0.2s ease, transform 0.05s ease',
-    }}
-    onMouseEnter={(e) => {
-      const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-      if (img) img.style.transform = 'scale(1.18)';
-      (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 0 10px #22c55e';
-    }}
-    onMouseLeave={(e) => {
-      const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-      if (img) img.style.transform = 'scale(1)';
-      (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
-    }}
-    onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
-    onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}
-  >
-    <img
-      src="/lizard.svg"
-      alt="Send"
-      style={{ width: 30, height: 30, display: 'block', transition: 'transform 0.2s ease' }}
-    />
-  </button>
-</form>
-</div>
-</div>
-</main>
-</div>
-);
+              <button
+                type="submit"
+                disabled={sending}
+                style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: '50%',
+                  border: '1px solid rgba(255,255,255,0.35)',
+                  background: 'linear-gradient(180deg, #34d399, #16a34a)',
+                  display: 'grid',
+                  placeItems: 'center',
+                  padding: 0,
+                  margin: 0,
+                  cursor: sending ? 'not-allowed' : 'pointer',
+                  transition: 'box-shadow 0.2s ease, transform 0.05s ease',
+                }}
+                onMouseEnter={(e) => {
+                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+                  if (img) img.style.transform = 'scale(1.18)';
+                  (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 0 10px #22c55e';
+                }}
+                onMouseLeave={(e) => {
+                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
+                  if (img) img.style.transform = 'scale(1)';
+                  (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
+                }}
+                onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
+                onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}
+              >
+                <img
+                  src="/lizard.svg"
+                  alt="Send"
+                  style={{ width: 30, height: 30, display: 'block', transition: 'transform 0.2s ease' }}
+                />
+              </button>
+            </form>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
 }

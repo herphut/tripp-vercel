@@ -87,9 +87,9 @@ function wantsImageTool(text: string | undefined) {
 
 // Extract a requested size if the user says “512x512”, else default 1024x1024
 function parseRequestedSize(text: string | undefined): "512x512" | "1024x1024" {
-  if (!text) return "1024x1024";
+  if (!text) return "512x512";
   const m = text.match(/\b(512x512|1024x1024)\b/i);
-  return (m?.[1]?.toLowerCase() as any) || "1024x1024";
+  return (m?.[1]?.toLowerCase() as any) || "512x512";
 }
 
 export async function POST(req: NextRequest) {
