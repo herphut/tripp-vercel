@@ -14,18 +14,11 @@ import { auditLog } from "../_lib/audit";
 import { readPrefs } from "@/app/api/_lib/prefs";
 import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
 
-// tool registry + validator
-import { trippTools } from "@/app/api/_lib/tools";
-import {
-  validateToolDefinitions,
-  validateInvocation,
-} from "@/app/api/_lib/toolvalidator";
+// ✅ Use built-in tool exposer (no custom function tools here)
+import { buildToolsForModel } from "@/app/api/_lib/tools";
 
 const system = TRIPP_PROMPT;
 const HISTORY_LIMIT = 30;
-
-// Precompile tool definition validation once
-const toolValidators = validateToolDefinitions(trippTools);
 
 // ---- types ----
 type TextTurn = { role: "system" | "user" | "assistant"; content: string };
@@ -85,41 +78,14 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
+// very conservative detector to hint we want the image_generation tool
 function wantsImageTool(text: string | undefined) {
   if (!text) return false;
-  // Very conservative trigger words
-  return /(^|\b)(generate|make|create|draw|render|design)\b.*\b(image|picture|sticker|logo|icon|art)\b/i.test(text)
-      || /\b(image_generate|img:|#image)\b/i.test(text);
-}
-
-// Build Responses-API tool list dynamically per request (no schema rewrite)
-function buildToolsForModel(opts: { isGuest: boolean }) {
-  if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
-  if (opts.isGuest) return undefined; // guests: no tools
-  if (!Array.isArray(trippTools) || trippTools.length === 0) return undefined;
-
-  const allowEnv = (process.env.TRIPP_ALLOWED_TOOLS || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowEnv.length === 0) return undefined; // empty allowlist = expose nothing
-
-  const allow = new Set(allowEnv);
-
-  const filtered = trippTools
-    .filter((t) => t && typeof t.name === "string" && t.name.trim())
-    .filter((t) => allow.has(t.name.toLowerCase()));
-
-  if (!filtered.length) return undefined;
-
-  // IMPORTANT: pass the tool's input_schema through as-is
-  return filtered.map((t) => ({
-    type: "function" as const,
-    name: t.name,
-    description: t.description ?? "",
-    parameters: t.input_schema ?? { type: "object", properties: {}, required: [] },
-    strict: true,
-  }));
+  return (
+    /(^|\b)(generate|make|create|draw|render|design)\b.*\b(image|picture|sticker|logo|icon|art)\b/i.test(
+      text
+    ) || /\b(image_generate|image_generation|img:|#image)\b/i.test(text)
+  );
 }
 
 export async function POST(req: NextRequest) {
@@ -329,15 +295,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ---------- TOOL CALLING LOOP ----------
+    // ---------- Built-in tools wiring ----------
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const toolsForModel =
-  buildToolsForModel({ isGuest }) &&
-  wantsImageTool(last?.content)
-    ? buildToolsForModel({ isGuest })    // expose tools only for image requests
-    : undefined;
 
-const maxToolHops = Math.max(0, Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1));
+    // Only expose built-ins for authed users; hint image tool only if relevant
+    const toolsForModel = buildToolsForModel({
+      isGuest,
+      wantsImages: wantsImageTool(last?.content),
+      wantsWeb: true,      // keep web search available to authed users if allowed
+      wantsFiles: false,   // enable later when you add file_search flows
+    });
+
+    const maxToolHops = Math.max(
+      0,
+      Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1)
+    );
 
     // first call
     let resp: any;
@@ -360,68 +332,34 @@ const maxToolHops = Math.max(0, Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1
         latency_ms: Date.now() - t0,
         error: msg,
       });
-  const expose = process.env.TRIPP_DEBUG === "1";
-return NextResponse.json(
-  { error: "openai_unavailable", reason: expose ? msg : "model_error", detail: expose ? (err?.response?.data ?? err?.error ?? String(err)) : undefined },
-  { status: 502, headers: { "Cache-Control": "no-store" } }
-);
+      const expose = process.env.TRIPP_DEBUG === "1";
+      return NextResponse.json(
+        {
+          error: "openai_unavailable",
+          reason: expose ? msg : "model_error",
+          detail: expose ? (err?.response?.data ?? err?.error ?? String(err)) : undefined,
+        },
+        { status: 502, headers: { "Cache-Control": "no-store" } }
+      );
     }
 
+    // If tools were exposed, optionally give the model a chance to follow-up after tool results
     if (toolsForModel && maxToolHops > 0) {
       for (let i = 0; i < maxToolHops; i++) {
-        // collect tool calls
-        const toolUses: Array<{ id: string; name: string; input: any }> = [];
+        // Collect tool_use blocks (built-in tools don't need our validators)
+        let sawToolUse = false;
         for (const out of (resp as any).output ?? []) {
           for (const part of out?.content ?? []) {
-            if (part?.type === "tool_use" && part?.name && part?.id) {
-              toolUses.push({ id: part.id, name: part.name, input: part.input });
+            if (part?.type === "tool_use") {
+              sawToolUse = true;
+              // We DO NOT execute anything here; built-ins are handled by OpenAI.
+              // The Responses API returns final content after tool runs.
             }
           }
         }
-        if (toolUses.length === 0) break;
+        if (!sawToolUse) break;
 
-        // execute tools (with arg validation) and append tool_result
-        for (const tu of toolUses) {
-          const inv = validateInvocation(toolValidators, tu.name, tu.input);
-          if (!inv.ok) {
-            (modelMessages as any[]).push({
-              role: "tool",
-              content: [
-                {
-                  type: "tool_result",
-                  tool_use_id: tu.id,
-                  content: JSON.stringify({
-                    error: "invalid_tool_args",
-                    detail: inv.errors,
-                  }),
-                },
-              ],
-            });
-            continue;
-          }
-
-          let result: any;
-          try {
-            const tool = trippTools.find((t) => t.name === tu.name)!;
-            result = await tool.execute(tu.input as any, { request: req });
-          } catch (e: any) {
-            result = { error: String(e?.message || e) };
-          }
-
-          (modelMessages as any[]).push({
-            role: "tool",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: tu.id,
-                content:
-                  typeof result === "string" ? result : JSON.stringify(result),
-              },
-            ],
-          });
-        }
-
-        // ask model again with tool results
+        // Ask the model again so it can summarize results it just fetched/generated
         try {
           resp = await openai.responses.create({
             model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
@@ -518,7 +456,7 @@ return NextResponse.json(
         messages,
         diag: {
           openai_used: true,
-          tools_enabled: !!buildToolsForModel({ isGuest }),
+          tools_enabled: !!toolsForModel,
           persisted: persist,
           memory_scope: identityUserId ? "user" : "session",
         },

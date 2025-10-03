@@ -47,45 +47,54 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "invalid_origin" }, { status: 403 });
   }
 
-  // ---- 1) Read ID token from cookies (with raw-header fallback) ----
-  let idToken = req.cookies.get("HH_ID_TOKEN")?.value ?? null;
-  if (!idToken) idToken = getCookieFromHeader(req.headers.get("cookie"), "HH_ID_TOKEN");
 
-  // ---- 2) Determine guest vs authed ----
-  const isGuest = !idToken;
-  let header: any = null, payload: any = null;
 
-  if (!isGuest) {
-    // Verify JWT
-    try {
-      const v = await verifyJwtRS256(idToken!);
-      header = v.header;
-      payload = v.payload;
-    } catch (e: any) {
-      try {
-        await db.insert(auditLogs).values({
-          createdAt: new Date(),
-          route: "/auth/exchange",
-          status: 401,
-          clientId: CLIENT_ID,
-          userId: null,
-          sessionId: null,
-          latencyMs: Date.now() - t0,
-          error: String(e?.message || e),
-        });
-      } catch {}
-      const refresh = `https://herphut.com/wp-json/herphut-sso/v1/refresh?return=${encodeURIComponent(
-        "https://tripp.herphut.com/"
-      )}`;
-      return NextResponse.json(
-        { error: "jwt_invalid", reason: String(e?.message || e), refresh },
-        { status: 401, headers: { "Cache-Control": "no-store" } }
-      );
+  // --- NO-DOWNGRADE + AUTH DECISION (replaces old Steps 1 & 2) ---
+
+// If we already have a user session cookie that points to a non-revoked user session,
+// don't downgrade to guest even if HH_ID_TOKEN is missing on this request.
+const existingSid = req.cookies.get("HH_SESSION_ID")?.value || null;
+let existingUserSessionUserId: string | null = null;
+
+if (existingSid) {
+  try {
+    const rows = await db
+      .select({ userId: chatSessions.userId, revokedAt: chatSessions.revokedAt })
+      .from(chatSessions)
+      .where(eq(chatSessions.sessionId, existingSid as any))
+      .limit(1);
+
+    const row = rows[0];
+    if (row && !row.revokedAt && row.userId) {
+      existingUserSessionUserId = String(row.userId);
     }
-  }
+  } catch {}
+}
 
-  const userId = isGuest ? null : String(payload.sub || "");
-  if (!isGuest && !userId) {
+let isGuest = false;
+let header: any = null;
+let payload: any = null;
+
+// Try to read the WordPress SSO token (if present)
+let idToken =
+  req.cookies.get("HH_ID_TOKEN")?.value ??
+  getCookieFromHeader(req.headers.get("cookie"), "HH_ID_TOKEN");
+
+if (existingUserSessionUserId) {
+  // Honor the existing authenticated session even if the token is absent this time
+  isGuest = false;
+  payload = { sub: existingUserSessionUserId, tier: "free" };
+} else if (!idToken) {
+  // No token and no existing authenticated session → guest
+  isGuest = true;
+} else {
+  // Verify token → authenticated
+  try {
+    const v = await verifyJwtRS256(idToken);
+    header = v.header;
+    payload = v.payload;
+    isGuest = false;
+  } catch (e: any) {
     try {
       await db.insert(auditLogs).values({
         createdAt: new Date(),
@@ -95,14 +104,40 @@ export async function POST(req: NextRequest) {
         userId: null,
         sessionId: null,
         latencyMs: Date.now() - t0,
-        error: "sub_missing",
+        error: String(e?.message || e),
       });
     } catch {}
+    const refresh = `https://herphut.com/wp-json/herphut-sso/v1/refresh?return=${encodeURIComponent(
+      "https://tripp.herphut.com/"
+    )}`;
     return NextResponse.json(
-      { error: "sub_missing" },
+      { error: "jwt_invalid", reason: String(e?.message || e), refresh },
       { status: 401, headers: { "Cache-Control": "no-store" } }
     );
   }
+}
+
+const userId = isGuest ? null : String(payload.sub || "");
+if (!isGuest && !userId) {
+  try {
+    await db.insert(auditLogs).values({
+      createdAt: new Date(),
+      route: "/auth/exchange",
+      status: 401,
+      clientId: CLIENT_ID,
+      userId: null,
+      sessionId: null,
+      latencyMs: Date.now() - t0,
+      error: "sub_missing",
+    });
+  } catch {}
+  return NextResponse.json(
+    { error: "sub_missing" },
+    { status: 401, headers: { "Cache-Control": "no-store" } }
+  );
+}
+// --- END NO-DOWNGRADE BLOCK ---
+
 
   // ---- 3) Device fingerprint (applies to guests too) ----
   const ua  = req.headers.get("user-agent") || "";
