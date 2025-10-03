@@ -14,9 +14,6 @@ import { auditLog } from "../_lib/audit";
 import { readPrefs } from "@/app/api/_lib/prefs";
 import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
 
-// ✅ Use built-in tool exposer (no custom function tools here)
-import { buildToolsForModel } from "@/app/api/_lib/tools";
-
 const system = TRIPP_PROMPT;
 const HISTORY_LIMIT = 30;
 
@@ -78,14 +75,37 @@ function haveKey(name: string) {
   return !!v && v.trim() !== "";
 }
 
-// very conservative detector to hint we want the image_generation tool
+// VERY conservative “does this look like an explicit image request?”
 function wantsImageTool(text: string | undefined) {
   if (!text) return false;
   return (
     /(^|\b)(generate|make|create|draw|render|design)\b.*\b(image|picture|sticker|logo|icon|art)\b/i.test(
       text
-    ) || /\b(image_generate|image_generation|img:|#image)\b/i.test(text)
+    ) || /\b(image_generation|image_generate|img:|#image)\b/i.test(text)
   );
+}
+
+// ---- built-in tools allowlist (env: TRIPP_BUILTIN_TOOLS=image_generation,web_search) ----
+function builtInToolsForRequest(opts: { isGuest: boolean; lastUserText: string | undefined }) {
+  if (process.env.TRIPP_DISABLE_TOOLS === "1") return undefined;
+  if (opts.isGuest) return undefined; // never expose tools to guests
+
+  // parse allowlist
+  const allowEnv = (process.env.TRIPP_BUILTIN_TOOLS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowEnv.length === 0) return undefined;
+
+  // Only expose image generation when user actually asks for an image
+  const tools: any[] = [];
+  if (allowEnv.includes("image_generation") && wantsImageTool(opts.lastUserText)) {
+    tools.push({ type: "image_generation" as const });
+  }
+
+  // (Later you can add: if (allowEnv.includes("web_search")) tools.push({ type: "web_search" as const }); )
+
+  return tools.length ? tools : undefined;
 }
 
 export async function POST(req: NextRequest) {
@@ -295,15 +315,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ---------- Built-in tools wiring ----------
+    // ---------- Built-in tools path ----------
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    // Only expose built-ins for authed users; hint image tool only if relevant
-    const toolsForModel = buildToolsForModel({
+    const toolsForModel = builtInToolsForRequest({
       isGuest,
-      wantsImages: wantsImageTool(last?.content),
-      wantsWeb: true,      // keep web search available to authed users if allowed
-      wantsFiles: false,   // enable later when you add file_search flows
+      lastUserText: last?.content,
     });
 
     const maxToolHops = Math.max(
@@ -337,29 +354,20 @@ export async function POST(req: NextRequest) {
         {
           error: "openai_unavailable",
           reason: expose ? msg : "model_error",
-          detail: expose ? (err?.response?.data ?? err?.error ?? String(err)) : undefined,
+          detail: expose
+            ? (err?.response?.data ?? err?.error ?? String(err))
+            : undefined,
         },
         { status: 502, headers: { "Cache-Control": "no-store" } }
       );
     }
 
-    // If tools were exposed, optionally give the model a chance to follow-up after tool results
-    if (toolsForModel && maxToolHops > 0) {
-      for (let i = 0; i < maxToolHops; i++) {
-        // Collect tool_use blocks (built-in tools don't need our validators)
-        let sawToolUse = false;
-        for (const out of (resp as any).output ?? []) {
-          for (const part of out?.content ?? []) {
-            if (part?.type === "tool_use") {
-              sawToolUse = true;
-              // We DO NOT execute anything here; built-ins are handled by OpenAI.
-              // The Responses API returns final content after tool runs.
-            }
-          }
-        }
-        if (!sawToolUse) break;
-
-        // Ask the model again so it can summarize results it just fetched/generated
+    // If tools are enabled, you can optionally re-ask with outputs. For image_generation,
+    // one hop is usually enough; keep the loop minimal.
+    if (toolsForModel && maxToolHops > 1) {
+      for (let i = 0; i < maxToolHops - 1; i++) {
+        // If the model still wants to use tools again, it will return new tool calls automatically.
+        // We’re not executing custom tools here, so just re-ask to let it finalize copy if needed.
         try {
           resp = await openai.responses.create({
             model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
@@ -393,7 +401,7 @@ export async function POST(req: NextRequest) {
         }
       }
     }
-    // ---------- end tool loop ----------
+    // ---------- end built-in tools path ----------
 
     const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
 
