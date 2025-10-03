@@ -35,6 +35,31 @@ type Body = {
 };
 
 // ---- helpers ----
+
+function extractImageBase64s(resp: any): string[] {
+  const out: string[] = [];
+  if (!resp) return out;
+
+  // The Responses payload can surface images either as top-level generation calls
+  // or as assistant message content blocks. We check both shapes.
+  for (const item of resp.output ?? []) {
+    // Case A: built-in tool call surfaced directly
+    if (item?.type === "image_generation_call" && item?.result) {
+      out.push(String(item.result));
+    }
+    // Case B: assistant message blocks
+    for (const part of item?.content ?? []) {
+      const maybe =
+        part?.image_base64 ?? part?.base64 ?? part?.data ?? part?.result ?? null;
+      if (typeof maybe === "string" && maybe.length > 1000) out.push(maybe);
+    }
+  }
+
+  // de-dup
+  return Array.from(new Set(out));
+}
+
+
 function makeTitleFrom(text: string): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
   const firstStop = cleaned.search(/[.!?]/);
@@ -315,95 +340,74 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ---------- Built-in tools path ----------
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+   // ---------- Built-in tools path ----------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    const toolsForModel = builtInToolsForRequest({
-      isGuest,
-      lastUserText: last?.content,
-    });
+const toolsForModel = builtInToolsForRequest({
+  isGuest,
+  lastUserText: last?.content,
+});
 
-    const maxToolHops = Math.max(
-      0,
-      Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1)
-    );
+const askedForImage =
+  !!toolsForModel?.some((t: any) => t?.type === "image_generation");
 
-    // first call
-    let resp: any;
-    try {
-      resp = await openai.responses.create({
-        model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
-        input: modelMessages as any,
-        ...(toolsForModel
-          ? { tools: toolsForModel as any, tool_choice: "auto" as const }
-          : {}),
-      });
-    } catch (err: any) {
-      const msg = `openai_create_failed: ${String(err?.message || err)}`;
-      await auditLog({
-        route: "/api/chat:POST",
-        status: 502,
-        client_id: clientId,
-        user_id: identityUserId,
-        session_id: sessionId,
-        latency_ms: Date.now() - t0,
-        error: msg,
-      });
-      const expose = process.env.TRIPP_DEBUG === "1";
-      return NextResponse.json(
-        {
-          error: "openai_unavailable",
-          reason: expose ? msg : "model_error",
-          detail: expose
-            ? (err?.response?.data ?? err?.error ?? String(err))
-            : undefined,
-        },
-        { status: 502, headers: { "Cache-Control": "no-store" } }
-      );
-    }
+// choose model: use gpt-image-1 when asking to generate an image
+const modelName = askedForImage
+  ? "gpt-image-1"
+  : (imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini");
 
-    // If tools are enabled, you can optionally re-ask with outputs. For image_generation,
-    // one hop is usually enough; keep the loop minimal.
-    if (toolsForModel && maxToolHops > 1) {
-      for (let i = 0; i < maxToolHops - 1; i++) {
-        // If the model still wants to use tools again, it will return new tool calls automatically.
-        // We’re not executing custom tools here, so just re-ask to let it finalize copy if needed.
-        try {
-          resp = await openai.responses.create({
-            model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
-            input: modelMessages as any,
-            tools: toolsForModel as any,
-            tool_choice: "auto",
-          });
-        } catch (err: any) {
-          const status = err?.status || err?.response?.status;
-          const apiMsg =
-            err?.error?.message ||
-            err?.response?.data?.error?.message ||
-            err?.response?.data?.message ||
-            err?.message ||
-            String(err);
+const maxToolHops = Math.max(
+  0,
+  Number(process.env.TRIPP_MAX_TOOLS_PER_CHAT || 1)
+);
 
-          await auditLog({
-            route: "/api/chat:POST",
-            status: 502,
-            client_id: clientId,
-            user_id: identityUserId,
-            session_id: sessionId,
-            latency_ms: Date.now() - t0,
-            error: `openai_error status=${status} msg=${apiMsg}`,
-          });
+// first call
+let resp: any;
+try {
+  resp = await openai.responses.create({
+    model: modelName,
+    input: modelMessages as any,
+    ...(toolsForModel
+      ? { tools: toolsForModel as any, tool_choice: "auto" as const }
+      : {}),
+  });
+} catch (err: any) {
+  const msg = `openai_create_failed: ${String(err?.message || err)}`;
+  await auditLog({
+    route: "/api/chat:POST",
+    status: 502,
+    client_id: clientId,
+    user_id: identityUserId,
+    session_id: sessionId,
+    latency_ms: Date.now() - t0,
+    error: msg,
+  });
+  const expose = process.env.TRIPP_DEBUG === "1";
+  return NextResponse.json(
+    {
+      error: "openai_unavailable",
+      reason: expose ? msg : "model_error",
+      detail: expose
+        ? (err?.response?.data ?? err?.error ?? String(err))
+        : undefined,
+    },
+    { status: 502, headers: { "Cache-Control": "no-store" } }
+  );
+}
 
-          return NextResponse.json(
-            { error: "openai_unavailable", reason: "model_error", detail: apiMsg },
-            { status: 502, headers: { "Cache-Control": "no-store" } }
-          );
-        }
-      }
-    }
     // ---------- end built-in tools path ----------
 
-    const assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+    let assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+
+if (askedForImage) {
+  const b64s = extractImageBase64s(resp);
+  if (b64s.length) {
+    const dataUrl = `data:image/png;base64,${b64s[0]}`;
+    // Keep it simple for now: return the data URL in the assistant text.
+    assistantText = `Here’s your image (data URL below). Copy to a new tab to view or save:\n\n${dataUrl}`;
+  }
+}
+
 
     // persist assistant turn if memory on
     if (persist) {
