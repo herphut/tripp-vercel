@@ -30,7 +30,6 @@ async function exchange(): Promise<ExchangeOK> {
     headers: { 'content-type': 'application/json' },
     body: '{}',
   });
-  // If JWT is invalid, server may still 401 with a refresh link
   if (r.status === 401) {
     const { refresh } = await r.json().catch(() => ({}));
     if (refresh) window.location.href = refresh;
@@ -56,7 +55,7 @@ async function fetchStatus(): Promise<StatusOK> {
 }
 // --------------------------------------------
 
-const LOCAL_HISTORY_LIMIT = 30;
+const LOCAL_HISTORY_LIMIT = 12;
 function buildRollingWindow(
   local: { role: 'user' | 'assistant'; content: string }[],
   newestUser: string
@@ -144,6 +143,9 @@ export default function ChatPage() {
   const [userId, setUserId] = useState<string | null>(null);
   const [memoryEnabled, setMemoryEnabled] = useState(false);
 
+  // did the user explicitly pick a prior session this visit?
+  const userSelectedSessionRef = useRef(false);
+
   // derive auth + upload rights
   const authed = !!userId;
   const canUploadImages = authed;
@@ -159,6 +161,7 @@ export default function ChatPage() {
   useEffect(() => {
     async function onSelect(e: Event) {
       const id = (e as CustomEvent<string>).detail;
+      userSelectedSessionRef.current = true; // user explicitly chose a session
       setSessionId(id);
 
       try {
@@ -202,20 +205,42 @@ export default function ChatPage() {
     };
   }, []);
 
-  // --------- BOOT: exchange + status ----------
+  // --------- BOOT: exchange + status + new session per visit ----------
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const x = await exchange(); // sets HH_SESSION_ID cookie server-side
+        // 1) set HH_SESSION_ID + read identity
+        const x = await exchange();
         if (cancelled) return;
-        setSessionId(x.session_id);
         setUserId(x.user_id ?? null);
 
+        // 2) memory preference
         const st = await fetchStatus();
         if (cancelled) return;
         setMemoryEnabled(!!st.memoryOptIn);
         localStorage.setItem('tripp:memoryOptIn', String(!!st.memoryOptIn));
+
+        // 3) ALWAYS start the visit on a NEW chat session (unless user already picked one)
+        if (!userSelectedSessionRef.current) {
+          try {
+            const r = await fetch('/api/session', { method: 'POST', credentials: 'include' });
+            const j = await r.json().catch(() => null);
+            if (cancelled) return;
+
+            if (j?.session_id) {
+              setSessionId(j.session_id);
+            } else {
+              // fallback: local-only session id so user can still chat
+              const localId =
+                (globalThis as any)?.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+              setSessionId(localId);
+            }
+          } finally {
+            // fresh slate either way
+            setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
+          }
+        }
       } catch (e: any) {
         setBootErr(e?.message || 'boot failed');
       } finally {
@@ -340,7 +365,7 @@ export default function ChatPage() {
         onToggleMemoryAction={(next) => setMemoryEnabled(next)}
         onNewChatAction={async () => {
           // start a fresh session (logged-in users will get a DB row; guests just a new id)
-          const r = await fetch('/api/sessions/new', { method: 'POST', credentials: 'include' });
+          const r = await fetch('/api/session', { method: 'POST', credentials: 'include' });
           const j = await r.json().catch(() => null);
           if (j?.session_id) {
             setSessionId(j.session_id);

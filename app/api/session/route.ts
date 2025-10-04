@@ -1,96 +1,70 @@
 // app/api/session/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { db, schema } from "@/app/api/_lib/db/db";
-import { desc, eq } from "drizzle-orm";
-import { verifyJwtRS256 } from "@/app/api/_lib/jwtVerify";
-import { readPrefs } from "@/app/api/_lib/prefs";
-import { auditLog } from "@/app/api/_lib/audit";
+export const runtime = "nodejs";
+import "server-only";
 
-async function userIdFromToken(req: NextRequest): Promise<string | null> {
-  const tok =
-    req.cookies.get("HH_ID_TOKEN")?.value ||
-    (req.headers.get("cookie") || "")
-      .split("; ")
-      .find((s) => s.startsWith("HH_ID_TOKEN="))
-      ?.split("=")[1];
-  if (!tok) return null;
+import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
+import { db, schema } from "@/app/api/_lib/db/db";
+import { auditLog } from "@/app/api/_lib/audit";
+import { getIdentity } from "@/app/api/_lib/identity";
+
+/**
+ * POST /api/session
+ * Creates a brand-new logical chat session id.
+ * - Does NOT touch auth cookies (that's /api/auth/exchange's job)
+ * - Inserts a chat_sessions row best-effort, but still returns a usable session_id if DB is down.
+ */
+export async function POST(req: NextRequest) {
+  const t0 = Date.now();
+  const { client_id, user_id } = await getIdentity(req);
+  const clientId = client_id ?? "webchat";
+  const sessionId = crypto.randomUUID();
+
   try {
-    const { payload } = await verifyJwtRS256(tok);
-    const uid = String(payload.sub || "");
-    return uid || null;
-  } catch {
-    return null;
+    // Best effort: create a row so messages/history can attach when memory is ON.
+    // (If a row already exists for this sessionId—unlikely—we do nothing.)
+    await db
+      .insert(schema.chatSessions)
+      .values({
+        sessionId,
+        clientId,
+        userId: user_id ?? null,
+      })
+      .onConflictDoNothing();
+
+    await auditLog({
+      route: "/api/session:POST",
+      status: 200,
+      client_id: clientId,
+      user_id,
+      session_id: sessionId,
+      latency_ms: Date.now() - t0,
+    });
+
+    return NextResponse.json(
+      { session_id: sessionId },
+      { headers: { "Cache-Control": "no-store" } }
+    );
+  } catch (e: any) {
+    // Still return a session id so the UI can proceed; flag the failure.
+    await auditLog({
+      route: "/api/session:POST",
+      status: 200, // respond OK so UX continues
+      client_id: clientId,
+      user_id,
+      session_id: sessionId,
+      latency_ms: Date.now() - t0,
+      error: `db_create_failed: ${String(e?.message || e)}`,
+    });
+
+    return NextResponse.json(
+      { session_id: sessionId, warn: "db_create_failed" },
+      { headers: { "Cache-Control": "no-store" } }
+    );
   }
 }
 
-export async function GET(req: NextRequest) {
-  const t0 = Date.now();
-  const userId = await userIdFromToken(req);
-
-  try {
-    // Anonymous users & memory-off users see no server-side history
-    if (!userId || !(await readPrefs(userId))) {
-      await auditLog({
-        route: "/api/session:GET",
-        status: 200,
-        client_id: "webchat",
-        user_id: userId,
-        session_id: null,
-        latency_ms: Date.now() - t0,
-      });
-      return NextResponse.json([], { headers: { "Cache-Control": "no-store" } });
-    }
-
-    // Pull last 25 sessions for this user, most recently active first
-    const rows = await db
-      .select({
-        // Use sessionId as the stable identifier for the UI
-        id: schema.chatSessions.sessionId,
-        title: schema.chatSessions.title,
-        created_at: schema.chatSessions.createdAt,
-        first_user_at: schema.chatSessions.firstUserAt,
-        updated_at: schema.chatSessions.updatedAt,
-        last_seen: schema.chatSessions.lastSeen,
-      })
-      .from(schema.chatSessions)
-      .where(eq(schema.chatSessions.userId, userId))
-      .orderBy(desc(schema.chatSessions.updatedAt))
-      .limit(25);
-
-    // Sidebar expects at least: { id, title|null, created_at, updated_at }
-    // (We include first_user_at / last_seen too—harmless if the UI ignores them.)
-    const out = rows.map((r) => ({
-      id: String(r.id),
-      title: r.title ?? null,
-      created_at: r.created_at,
-      first_user_at: r.first_user_at,
-      updated_at: r.updated_at,
-      last_seen: r.last_seen,
-    }));
-
-    await auditLog({
-      route: "/api/session:GET",
-      status: 200,
-      client_id: "webchat",
-      user_id: userId,
-      session_id: null,
-      latency_ms: Date.now() - t0,
-    });
-
-    return NextResponse.json(out, { headers: { "Cache-Control": "no-store" } });
-  } catch (e: any) {
-    await auditLog({
-      route: "/api/session:GET",
-      status: 500,
-      client_id: "webchat",
-      user_id: userId,
-      session_id: null,
-      latency_ms: Date.now() - t0,
-      error: String(e?.message || e),
-    });
-    return NextResponse.json(
-      { error: "session_list_failed" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
-    );
-  }
+// Optional: reject other methods explicitly (helps with noisy crawlers)
+export async function GET() {
+  return NextResponse.json({ error: "method_not_allowed" }, { status: 405 });
 }
