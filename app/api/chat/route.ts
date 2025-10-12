@@ -85,6 +85,24 @@ function wantsImageTool(text: string | undefined) {
   );
 }
 
+function extractImageBase64s(resp: any): string[] {
+  const out: string[] = [];
+  for (const item of resp?.output ?? []) {
+    // Built-in image tool output
+    if (item?.type === "image_generation_call" && item?.result) {
+      out.push(String(item.result));
+    }
+    // Assistant blocks that carry images
+    for (const part of item?.content ?? []) {
+      const maybe =
+        part?.image_base64 ?? part?.base64 ?? part?.data ?? part?.result ?? null;
+      if (typeof maybe === "string" && maybe.length > 1000) out.push(maybe);
+    }
+  }
+  return Array.from(new Set(out));
+}
+
+
 // Extract a requested size if the user says “512x512”, else default 1024x1024
 function parseRequestedSize(text: string | undefined): "512x512" | "1024x1024" {
   if (!text) return "512x512";
