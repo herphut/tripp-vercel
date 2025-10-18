@@ -34,6 +34,24 @@ export default function Sidebar({ authed, memoryEnabled, onToggleMemoryAction, o
     return () => { stop = true; };
   }, [authed]);
 
+    // listen for refresh events triggered elsewhere (new chat, send, etc.)
+  useEffect(() => {
+    function refreshRecents() {
+      (async () => {
+        try {
+          const r = await fetch('/api/sessions/recent', { credentials: 'include', cache: 'no-store' });
+          const j = await r.json().catch(() => ({ items: [] }));
+          setRecent(Array.isArray(j.items) ? j.items : []);
+        } catch {
+          setRecent([]);
+        }
+      })();
+    }
+
+    window.addEventListener('tripp:refreshRecents', refreshRecents);
+    return () => window.removeEventListener('tripp:refreshRecents', refreshRecents);
+  }, []);
+
   async function setMemory(next: boolean) {
     onToggleMemoryAction(next); // optimistic reflect
     try {

@@ -87,7 +87,7 @@ function renderMessageContent(text: string) {
       <img
         src={trimmed}
         alt="image"
-        style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+        style={{ maxHeight: 420, maxWidth: 720, borderRadius: 8, display: 'block',  objectFit: 'contain'}}
       />
     );
   }
@@ -103,7 +103,7 @@ function renderMessageContent(text: string) {
         <img
           src={dataMatch[0]}
           alt="image"
-          style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+          style={{ maxHeight: 420, maxWidth: 720, borderRadius: 8, display: 'block' }}
         />
         {after && <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{after}</div>}
       </>
@@ -116,7 +116,7 @@ function renderMessageContent(text: string) {
       <img
         src={trimmed}
         alt="image"
-        style={{ maxWidth: 720, borderRadius: 8, display: 'block' }}
+        style={{ maxHeight: 420, maxWidth: 720, borderRadius: 8, display: 'block' }}
       />
     );
   }
@@ -238,7 +238,7 @@ export default function ChatPage() {
             }
           } finally {
             // fresh slate either way
-            setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
+            setMessages([{ role: 'assistant', content: "Hi! I'm Tripp. You're chatting with the new HerpHut AI. How can I help today?" }]);
           }
         }
       } catch (e: any) {
@@ -252,6 +252,31 @@ export default function ChatPage() {
     };
   }, []);
   // --------------------------------------------
+
+  // 🔁 Sliding session heartbeat (extends cookies periodically)
+useEffect(() => {
+  let stop = false;
+  const id = setInterval(async () => {
+    if (stop) return;
+    try {
+      await fetch('/api/auth/exchange?silent=1', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      // Server silently refreshes cookies to extend TTL
+    } catch (err) {
+      console.warn('Heartbeat refresh failed:', err);
+    }
+  }, 8 * 60 * 1000); // every 8 minutes
+
+  return () => {
+    stop = true;
+    clearInterval(id);
+  };
+}, []);
+
 
   function handleNewChat() {
     setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
@@ -342,6 +367,7 @@ export default function ChatPage() {
           : [{ role: 'assistant', content: String(data?.reply ?? data?.text ?? '') }];
 
       setMessages(serverMsgs);
+      window.dispatchEvent(new Event('tripp:refreshRecents'));
     } catch {
       setMessages((m) => [
         ...m,
@@ -373,6 +399,9 @@ export default function ChatPage() {
           } else {
             handleNewChat();
           }
+
+          window.dispatchEvent(new Event('tripp:refreshRecents'));
+
         }}
         headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
       />

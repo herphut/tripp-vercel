@@ -104,10 +104,10 @@ function extractImageBase64s(resp: any): string[] {
 
 
 // Extract a requested size if the user says “512x512”, else default 1024x1024
-function parseRequestedSize(text: string | undefined): "512x512" | "1024x1024" {
-  if (!text) return "512x512";
-  const m = text.match(/\b(512x512|1024x1024)\b/i);
-  return (m?.[1]?.toLowerCase() as any) || "512x512";
+function parseRequestedSize(text: string | undefined): "1024x1024" | "1024x1536" | "1536x1024" | "auto" {
+  if (!text) return "1024x1024";
+  const m = text.match(/\b(1024x1024|1024x1536|1536x1024|auto)\b/i);
+  return (m?.[1]?.toLowerCase() as any) || "1024x1024";
 }
 
 export async function POST(req: NextRequest) {
