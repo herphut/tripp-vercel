@@ -20,6 +20,9 @@ export async function POST(req: NextRequest) {
   const clientId = client_id ?? "webchat";
   const sessionId = crypto.randomUUID();
 
+  const maxAge = 30 * 24 * 60 * 60; // 30 days
+  const secureFlag = process.env.NODE_ENV === "production" ? "Secure; " : "";
+
   try {
     // Best effort: create a row so messages/history can attach when memory is ON.
     // (If a row already exists for this sessionId—unlikely—we do nothing.)
@@ -32,34 +35,47 @@ export async function POST(req: NextRequest) {
       })
       .onConflictDoNothing();
 
-    await auditLog({
-      route: "/api/session:POST",
-      status: 200,
-      client_id: clientId,
-      user_id,
-      session_id: sessionId,
-      latency_ms: Date.now() - t0,
-    });
+    try {
+      await auditLog({
+        route: "/api/session:POST",
+        status: 200,
+        client_id: clientId,
+        user_id,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+      });
+    } catch (logErr) {
+      console.warn("auditLog failed:", logErr);
+    }
+
+    // If this is an anonymous session, set an ANON_SESSION_ID cookie so the browser includes it on subsequent requests.
+    const cookie = `ANON_SESSION_ID=${sessionId}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax; ${secureFlag}`;
 
     return NextResponse.json(
       { session_id: sessionId },
-      { headers: { "Cache-Control": "no-store" } }
+      { headers: { "Cache-Control": "no-store", "Set-Cookie": cookie } }
     );
   } catch (e: any) {
     // Still return a session id so the UI can proceed; flag the failure.
-    await auditLog({
-      route: "/api/session:POST",
-      status: 200, // respond OK so UX continues
-      client_id: clientId,
-      user_id,
-      session_id: sessionId,
-      latency_ms: Date.now() - t0,
-      error: `db_create_failed: ${String(e?.message || e)}`,
-    });
+    try {
+      await auditLog({
+        route: "/api/session:POST",
+        status: 500, // record real failure
+        client_id: clientId,
+        user_id,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+        error: `db_create_failed: ${String(e?.message || e)}`,
+      });
+    } catch (logErr) {
+      console.warn("auditLog failed:", logErr);
+    }
+
+    const cookie = `ANON_SESSION_ID=${sessionId}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax; ${secureFlag}`;
 
     return NextResponse.json(
       { session_id: sessionId, warn: "db_create_failed" },
-      { headers: { "Cache-Control": "no-store" } }
+      { headers: { "Cache-Control": "no-store", "Set-Cookie": cookie } }
     );
   }
 }

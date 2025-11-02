@@ -152,6 +152,10 @@ export default function ChatPage() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Send button interaction state (replaces DOM manipulation)
+  const [hoveringSend, setHoveringSend] = useState(false);
+  const [pressingSend, setPressingSend] = useState(false);
+
   // Auto-scroll
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -242,6 +246,11 @@ export default function ChatPage() {
           }
         }
       } catch (e: any) {
+        // Suppress the transient 'needs_refresh' thrown by exchange() which triggers a redirect.
+        // Only show a UI auth error for other issues.
+        if (e?.message === 'needs_refresh') {
+          return;
+        }
         setBootErr(e?.message || 'boot failed');
       } finally {
         setReady(true);
@@ -300,8 +309,13 @@ useEffect(() => {
       if (!r.ok) throw new Error(await r.text());
       const j = await r.json();
       setImageUrl(j.url || j.downloadUrl || null);
-    } catch {
-      setMessages((m) => [...m, { role: 'assistant', content: 'Upload failed. Please try another image.' }]);
+    } catch (err: any) {
+      console.error('Upload failed:', err);
+      const suffix = err?.message ? ` (${String(err.message).slice(0, 120)})` : '';
+      setMessages((m) => [
+        ...m,
+        { role: 'assistant', content: `Upload failed. Please try another image.${suffix}` },
+      ]);
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = '';
@@ -547,6 +561,7 @@ useEffect(() => {
                 onChange={(e) => setInput(e.target.value)}
                 placeholder={imageUrl ? 'Add a question about the image…' : 'Type your message...'}
                 disabled={sending}
+                aria-label="Message input"
                 style={{
                   flex: 1,
                   border: 'none',
@@ -560,6 +575,7 @@ useEffect(() => {
               <button
                 type="submit"
                 disabled={sending}
+                aria-label="Send message"
                 style={{
                   width: 44,
                   height: 44,
@@ -572,24 +588,27 @@ useEffect(() => {
                   margin: 0,
                   cursor: sending ? 'not-allowed' : 'pointer',
                   transition: 'box-shadow 0.2s ease, transform 0.05s ease',
+                  boxShadow: hoveringSend ? '0 0 10px #22c55e' : 'none',
+                  transform: pressingSend ? 'translateY(1px)' : 'translateY(0)',
                 }}
-                onMouseEnter={(e) => {
-                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-                  if (img) img.style.transform = 'scale(1.18)';
-                  (e.currentTarget as HTMLButtonElement).style.boxShadow = '0 0 10px #22c55e';
+                onMouseEnter={() => setHoveringSend(true)}
+                onMouseLeave={() => {
+                  setHoveringSend(false);
+                  setPressingSend(false);
                 }}
-                onMouseLeave={(e) => {
-                  const img = e.currentTarget.querySelector('img') as HTMLElement | null;
-                  if (img) img.style.transform = 'scale(1)';
-                  (e.currentTarget as HTMLButtonElement | any).style.boxShadow = 'none';
-                }}
-                onMouseDown={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(1px)')}
-                onMouseUp={(e) => ((e.currentTarget as HTMLButtonElement).style.transform = 'translateY(0)')}
+                onMouseDown={() => setPressingSend(true)}
+                onMouseUp={() => setPressingSend(false)}
               >
                 <img
                   src="/lizard.svg"
                   alt="Send"
-                  style={{ width: 30, height: 30, display: 'block', transition: 'transform 0.2s ease' }}
+                  style={{
+                    width: 30,
+                    height: 30,
+                    display: 'block',
+                    transition: 'transform 0.2s ease',
+                    transform: hoveringSend ? 'scale(1.18)' : 'scale(1)',
+                  }}
                 />
               </button>
             </form>
