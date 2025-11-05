@@ -84,22 +84,9 @@ function wantsImageTool(text: string | undefined) {
   );
 }
 
-function extractImageBase64s(resp: any): string[] {
-  const out: string[] = [];
-  for (const item of resp?.output ?? []) {
-    if (item?.type === "image_generation_call" && item?.result) {
-      out.push(String(item.result));
-    }
-    for (const part of item?.content ?? []) {
-      const maybe =
-        part?.image_base64 ?? part?.base64 ?? part?.data ?? part?.result ?? null;
-      if (typeof maybe === "string" && maybe.length > 1000) out.push(maybe);
-    }
-  }
-  return Array.from(new Set(out));
-}
-
-function parseRequestedSize(text: string | undefined): "1024x1024" | "1024x1536" | "1536x1024" | "auto" {
+function parseRequestedSize(
+  text: string | undefined
+): "1024x1024" | "1024x1536" | "1536x1024" | "auto" {
   if (!text) return "1024x1024";
   const m = text.match(/\b(1024x1024|1024x1536|1536x1024|auto)\b/i);
   return (m?.[1]?.toLowerCase() as any) || "1024x1024";
@@ -176,7 +163,9 @@ export async function POST(req: NextRequest) {
 
     // Save inbound user turn + set title/first_user_at once (only if persisting)
     let lastUserMessageId: number | null = null;
-    let persistedHistory: { role: string; content: string; created_at: string }[] | null = null;
+    let persistedHistory:
+      | { role: string; content: string | null; created_at: Date }[]
+      | null = null;
 
     if (persist) {
       try {
@@ -204,6 +193,19 @@ export async function POST(req: NextRequest) {
             lastSeen: new Date(),
           })
           .where(eq(schema.chatSessions.sessionId, sessionId));
+
+        // Load history AFTER saving user turn
+        const history = await db
+          .select({
+            role: schema.chatMessages.role,
+            content: schema.chatMessages.content,
+            created_at: schema.chatMessages.createdAt,
+          })
+          .from(schema.chatMessages)
+          .where(eq(schema.chatMessages.sessionId, sessionId))
+          .orderBy(asc(schema.chatMessages.createdAt));
+
+        persistedHistory = history as any[];
       } catch (dbErr) {
         const msg = String((dbErr as any)?.message ?? dbErr);
         console.error("DB insert user or session update failed:", dbErr);
@@ -224,44 +226,21 @@ export async function POST(req: NextRequest) {
     // Build model input
     const modelMessages: ModelTurn[] = [{ role: "system", content: system }];
 
-    if (persist) {
-      try {
-        const history = await db
-          .select({
-            role: schema.chatMessages.role,
-            content: schema.chatMessages.content,
-            created_at: schema.chatMessages.createdAt,
-          })
-          .from(schema.chatMessages)
-          .where(eq(schema.chatMessages.sessionId, sessionId))
-          .orderBy(asc(schema.chatMessages.createdAt));
-
-        persistedHistory = history as any[];
-
-        const trimmed = history
-          .slice(-HISTORY_LIMIT)
-          .map((h) => ({
-            role: h.role as "user" | "assistant",
-            content: h.content ?? "",
-          }));
-
-        modelMessages.push(...(trimmed as ModelTurn[]));
-      } catch (histErr) {
-        console.warn("Failed to load persisted history, falling back to rolling window:", histErr);
-        await auditLog({
-          route: "/api/chat:POST",
-          status: 500,
-          client_id: clientId,
-          user_id: identityUserId,
-          session_id: sessionId,
-          latency_ms: Date.now() - t0,
-          error: "history_select_failed",
-        });
-        persist = false;
-      }
-    }
-
-    if (!persist) {
+    if (persist && persistedHistory) {
+      const trimmed = persistedHistory
+        .slice(-HISTORY_LIMIT)
+        .map((h) => ({
+          role: h.role as "user" | "assistant",
+          content: h.content ?? "",
+        }));
+      modelMessages.push(...(trimmed as ModelTurn[]));
+      // Ensure last user content is in the model messages:
+      const needLast =
+        trimmed.length === 0 ||
+        trimmed[trimmed.length - 1].role !== "user" ||
+        trimmed[trimmed.length - 1].content !== last.content;
+      if (needLast) modelMessages.push({ role: "user", content: last.content });
+    } else {
       const rolling = body.messages
         .filter(
           (m) =>
@@ -326,22 +305,24 @@ export async function POST(req: NextRequest) {
         `Echo: ${last.content}` +
         (maybeAttached ? `\n\n(Attached image: ${maybeAttached})` : "");
 
-      const messagesOut = persist && persistedHistory
-        ? persistedHistory
-        : [
-            ...modelMessages
-              .filter((m: any) => m.role !== "system")
-              .map((m: any) => ({
-                role: m.role,
-                content: (m as any).content,
-                created_at: new Date().toISOString(),
-              })),
-            {
-              role: "assistant",
-              content: assistantText,
+      const base = persistedHistory
+        ? persistedHistory.map((h) => ({
+            role: h.role,
+            content: h.content ?? "",
+            created_at: (h as any).created_at?.toISOString?.() ?? new Date().toISOString(),
+          }))
+        : modelMessages
+            .filter((m: any) => m.role !== "system")
+            .map((m: any) => ({
+              role: m.role,
+              content: typeof m.content === "string" ? m.content : last.content,
               created_at: new Date().toISOString(),
-            },
-          ];
+            }));
+
+      const messagesOut = [
+        ...base,
+        { role: "assistant", content: assistantText, created_at: new Date().toISOString() },
+      ];
 
       await auditLog({
         route: "/api/chat:POST",
@@ -366,87 +347,141 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ---------- Model call (images if asked, otherwise Responses) ----------
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    // ---------- Model call ----------
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
-    let resp: any = null;
-    let assistantText: string | null = null;
+let assistantText: string | null = null;
 
-    if (!isGuest && wantsImageTool(last?.content)) {
-      try {
-        const size = parseRequestedSize(last?.content);
-        const img = await openai.images.generate({
-          model: "gpt-image-1",
+// If user asked for an image, do NOT block here—return immediately with stream info.
+if (!isGuest && wantsImageTool(last?.content)) {
+  const size = parseRequestedSize(last?.content);
+  const partials = 2; // 1–3 is a good range
+
+  // Build the base transcript we’ll return right away
+  const base = persistedHistory
+    ? persistedHistory.map((h) => ({
+        role: h.role,
+        content: h.content ?? "",
+        created_at:
+          (h as any).created_at?.toISOString?.() ??
+          (h as any).created_at ??
+          new Date().toISOString(),
+      }))
+    : modelMessages
+        .filter((m: any) => m.role !== "system")
+        .map((m: any) => ({
+          role: m.role,
+          content: typeof m.content === "string" ? m.content : last.content,
+          created_at: new Date().toISOString(),
+        }));
+
+  // Optional: persist a placeholder assistant message so a bubble appears instantly
+  if (persist) {
+    try {
+      await db.insert(schema.chatMessages).values({
+        sessionId,
+        userId: identityUserId ?? null,
+        role: "assistant",
+        content:
+          "Streaming your image… (this will refine in real time and finalize shortly)",
+      });
+
+      await db
+        .update(schema.chatSessions)
+        .set({ updatedAt: new Date(), lastSeen: new Date() })
+        .where(eq(schema.chatSessions.sessionId, sessionId));
+    } catch (assistErr) {
+      console.warn("Failed to persist streaming placeholder:", assistErr);
+    }
+  }
+
+  const placeholder = {
+    role: "assistant",
+    content: "Streaming your image… (you’ll see it refine live 🥚🦎)",
+    created_at: new Date().toISOString(),
+  };
+
+  await auditLog({
+    route: "/api/chat:POST",
+    status: 200,
+    client_id: clientId,
+    user_id: identityUserId,
+    session_id: sessionId,
+    latency_ms: Date.now() - t0,
+  });
+
+  // Return immediately with SSE stream pointer for the client
+  return NextResponse.json(
+    {
+      messages: [...base, placeholder],
+      diag: {
+        openai_used: true,
+        tools_enabled: true,
+        persisted: persist,
+        memory_scope: identityUserId ? "user" : "session",
+        stream: {
+          kind: "image",
+          url: `/api/image/stream?${new URLSearchParams({
+            prompt: last.content,
+            size,
+            partials: String(partials),
+          }).toString()}`,
           prompt: last.content,
           size,
-        });
+          partials,
+        },
+      },
+    },
+    { headers: { "Cache-Control": "no-store" } }
+  );
+}
 
-        const b64 = img.data?.[0]?.b64_json;
-        if (b64 && typeof b64 === "string") {
-          assistantText = `Here is your image:\n\ndata:image/png;base64,${b64}`;
-        } else {
-          assistantText =
-            "I tried to generate an image but didn’t receive data back. Please try again.";
-        }
-      } catch (err: any) {
-        const msg = err?.response?.data?.error?.message || err?.message || String(err);
-        await auditLog({
-          route: "/api/chat:POST",
-          status: 502,
-          client_id: clientId,
-          user_id: identityUserId,
-          session_id: sessionId,
-          latency_ms: Date.now() - t0,
-          error: `images_api_error: ${msg}`,
-        });
-        return NextResponse.json(
-          { error: "openai_unavailable", reason: "images_api_error", detail: msg },
-          { status: 502, headers: { "Cache-Control": "no-store" } }
-        );
-      }
-    } else {
-      try {
-        resp = await openai.responses.create({
-          model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
-          input: modelMessages as any,
-        });
-        assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
-      } catch (err: any) {
-        const msg = `openai_create_failed: ${String(err?.message || err)}`;
-        await auditLog({
-          route: "/api/chat:POST",
-          status: 502,
-          client_id: clientId,
-          user_id: identityUserId,
-          session_id: sessionId,
-          latency_ms: Date.now() - t0,
-          error: msg,
-        });
-        const expose = process.env.TRIPP_DEBUG === "1";
-        return NextResponse.json(
-          {
-            error: "openai_unavailable",
-            reason: expose ? msg : "model_error",
-            detail: expose
-              ? (err?.response?.data ?? err?.error ?? String(err))
-              : undefined,
-          },
-          { status: 502, headers: { "Cache-Control": "no-store" } }
-        );
-      }
-    }
-    // ---------- end model call ----------
+// Otherwise: normal text model path (blocking)
+try {
+  const resp = await openai.responses.create({
+    model: imageUrl ? "gpt-4o-mini" : "gpt-4.1-mini",
+    input: modelMessages as any,
+  });
+  assistantText = resp.output_text?.trim() || "Sorry, I came up empty.";
+} catch (err: any) {
+  const msg = `openai_create_failed: ${String(err?.message || err)}`;
+  await auditLog({
+    route: "/api/chat:POST",
+    status: 502,
+    client_id: clientId,
+    user_id: identityUserId,
+    session_id: sessionId,
+    latency_ms: Date.now() - t0,
+    error: msg,
+  });
+  const expose = process.env.TRIPP_DEBUG === "1";
+  return NextResponse.json(
+    {
+      error: "openai_unavailable",
+      reason: expose ? msg : "model_error",
+      detail: expose
+        ? (err?.response?.data ?? err?.error ?? String(err))
+        : undefined,
+    },
+    { status: 502, headers: { "Cache-Control": "no-store" } }
+  );
+}
+// ---------- end model call ----------
+
 
     // persist assistant turn if memory on
     let assistantMessageId: number | null = null;
     if (persist && assistantText) {
       try {
-        const insertedAssistant = (await db.insert(schema.chatMessages).values({
-          sessionId,
-          userId: identityUserId ?? null,
-          role: "assistant",
-          content: assistantText,
-        }).returning({ id: schema.chatMessages.id })) as any;
+        const insertedAssistant = (await db
+          .insert(schema.chatMessages)
+          .values({
+            sessionId,
+            userId: identityUserId ?? null,
+            role: "assistant",
+            content: assistantText,
+          })
+          .returning({ id: schema.chatMessages.id })) as any;
 
         assistantMessageId = Array.isArray(insertedAssistant)
           ? insertedAssistant[0]?.id ?? null
@@ -462,7 +497,9 @@ export async function POST(req: NextRequest) {
             await db
               .update(schema.attachments)
               .set({ messageId: assistantMessageId })
-              .where(sql`${schema.attachments.sessionId} = ${sessionId} AND ${schema.attachments.messageId} IS NULL`);
+              .where(
+                sql`${schema.attachments.sessionId} = ${sessionId} AND ${schema.attachments.messageId} IS NULL`
+              );
           } catch (linkErr) {
             console.warn("Failed to backfill attachment.messageId:", linkErr);
             await auditLog({
@@ -485,29 +522,41 @@ export async function POST(req: NextRequest) {
           user_id: identityUserId,
           session_id: sessionId,
           latency_ms: Date.now() - t0,
-          error: `db_insert_assistant_failed: ${String((assistErr as any)?.message ?? assistErr)}`,
+          error: `db_insert_assistant_failed: ${String(
+            (assistErr as any)?.message ?? assistErr
+          )}`,
         });
       }
     }
 
-    // build response transcript (reuse persistedHistory when present)
-    const messages =
-      persist && persistedHistory
-        ? persistedHistory
-        : [
-            ...modelMessages
-              .filter((m: any) => m.role !== "system")
-              .map((m: any) => ({
-                role: m.role,
-                content: typeof m.content === "string" ? m.content : last.content,
-                created_at: new Date().toISOString(),
-              })),
-            {
-              role: "assistant",
-              content: assistantText ?? "Sorry, I came up empty.",
-              created_at: new Date().toISOString(),
-            },
-          ];
+    // ----------- Build response transcript (FIXED) -----------
+    // Always include the assistant turn we just generated, even when using persistedHistory.
+    const base = persistedHistory
+      ? persistedHistory.map((h) => ({
+          role: h.role,
+          content: h.content ?? "",
+          created_at:
+            (h as any).created_at?.toISOString?.() ??
+            (h as any).created_at ??
+            new Date().toISOString(),
+        }))
+      : modelMessages
+          .filter((m: any) => m.role !== "system")
+          .map((m: any) => ({
+            role: m.role,
+            content: typeof m.content === "string" ? m.content : last.content,
+            created_at: new Date().toISOString(),
+          }));
+
+    const messages = [
+      ...base,
+      {
+        role: "assistant",
+        content: assistantText ?? "Sorry, I came up empty.",
+        created_at: new Date().toISOString(),
+      },
+    ];
+    // ---------------------------------------------------------
 
     await auditLog({
       route: "/api/chat:POST",

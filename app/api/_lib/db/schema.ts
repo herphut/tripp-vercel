@@ -70,6 +70,7 @@ export const chatSessions = tripp.table(
 
     title: varchar("title", { length: 120 }),
     firstUserAt: timestamp("first_user_at", { withTimezone: true }),
+    idempotencyKey: varchar("idempotency_key", { length: 255 }),
   },
   (t) => ({
     byUser:   index("chat_sessions_user_idx").on(t.userId),

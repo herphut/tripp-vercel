@@ -1,86 +1,262 @@
 // app/api/session/route.ts
-export const runtime = "nodejs";
 import "server-only";
+export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
+
 import { db, schema } from "@/app/api/_lib/db/db";
+import { eq, and, ne, desc, gt, isNull } from "drizzle-orm";
+
+// Optional utilities in your project
 import { auditLog } from "@/app/api/_lib/audit";
 import { getIdentity } from "@/app/api/_lib/identity";
 
-/**
- * POST /api/session
- * Creates a brand-new logical chat session id.
- * - Does NOT touch auth cookies (that's /api/auth/exchange's job)
- * - Inserts a chat_sessions row best-effort, but still returns a usable session_id if DB is down.
- */
+const ANON_COOKIE = "ANON_SESSION_ID";
+const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 365; // 1 year
+
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
-  const { client_id, user_id } = await getIdentity(req);
-  const clientId = client_id ?? "webchat";
-  const sessionId = crypto.randomUUID();
+  const url = new URL(req.url);
+  const isSecure = url.protocol === "https:";
 
-  const maxAge = 30 * 24 * 60 * 60; // 30 days
-  const secureFlag = process.env.NODE_ENV === "production" ? "Secure; " : "";
+  // Read anon cookie (if any)
+  const cookieHeader = req.headers.get("cookie") ?? "";
+  const anonCookie = readCookie(cookieHeader, ANON_COOKIE);
+
+  // Identity (safe)
+  const { userId, deviceHash, ip, ua } = await safeGetIdentity(req);
+
+  // Parse body for idempotency
+  const body = await safeJson(req);
+  const idempotencyKey: string | null = body?.idempotencyKey ?? null;
 
   try {
-    // Best effort: create a row so messages/history can attach when memory is ON.
-    // (If a row already exists for this sessionId—unlikely—we do nothing.)
-    await db
-      .insert(schema.chatSessions)
-      .values({
-        sessionId,
-        clientId,
-        userId: user_id ?? null,
-      })
-      .onConflictDoNothing();
-
-    try {
-      await auditLog({
-        route: "/api/session:POST",
-        status: 200,
-        client_id: clientId,
-        user_id,
-        session_id: sessionId,
-        latency_ms: Date.now() - t0,
+    // 1) If logged-in user + anon cookie present → PROMOTE guest to user
+    if (userId && anonCookie) {
+      const promoted = await promoteGuestSession({
+        userId,
+        guestSessionId: anonCookie,
       });
-    } catch (logErr) {
-      console.warn("auditLog failed:", logErr);
+
+      if (promoted) {
+        await safeAudit({
+          event: "session.promote",
+          data: { userId, sessionId: promoted, deviceHash, ip, ua },
+        });
+        return ok({ sessionId: promoted, isSecure, setAnonCookie: false });
+      }
+      // If promotion couldn't happen (cookie stale/missing), we fall through to create/reuse
     }
 
-    // If this is an anonymous session, set an ANON_SESSION_ID cookie so the browser includes it on subsequent requests.
-    const cookie = `ANON_SESSION_ID=${sessionId}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax; ${secureFlag}`;
+    // 2) If idempotencyKey provided, try to reuse
+    if (idempotencyKey) {
+      const reused = await reuseByIdempotency(idempotencyKey);
+      if (reused) {
+        await safeAudit({
+          event: "session.reuse",
+          data: { userId, sessionId: reused, idempotencyKey, deviceHash, ip, ua },
+        });
+        return ok({ sessionId: reused, isSecure, setAnonCookie: !userId });
+      }
+    }
 
-    return NextResponse.json(
-      { session_id: sessionId },
-      { headers: { "Cache-Control": "no-store", "Set-Cookie": cookie } }
-    );
+    // 3) Create a new session (anon or user) idempotently
+    const newSessionId: string = crypto.randomUUID();
+
+    // Drizzle upsert-by-idempotency: try insert; if unique violation, select the existing
+    let createdSessionId: string = newSessionId;
+    try {
+      const inserted = await db
+        .insert(schema.chatSessions)
+        .values({
+          sessionId: newSessionId,
+          userId: userId ?? null,
+          deviceHash: deviceHash ?? null,
+          idempotencyKey: idempotencyKey ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning({ sessionId: schema.chatSessions.sessionId });
+
+      createdSessionId = inserted[0].sessionId;
+    } catch (e: any) {
+      // If collide on idempotency unique index, re-select
+      if (String(e?.message || "").toLowerCase().includes("duplicate key")) {
+        const reused = await reuseByIdempotency(idempotencyKey!);
+        if (reused) createdSessionId = reused;
+        else throw e;
+      } else {
+        throw e;
+      }
+    }
+
+    await safeAudit({
+      event: "session.create",
+      data: {
+        userId,
+        sessionId: createdSessionId,
+        idempotencyKey,
+        deviceHash,
+        ip,
+        ua,
+        latency_ms: Date.now() - t0,
+      },
+    });
+
+    return ok({ sessionId: createdSessionId, isSecure, setAnonCookie: !userId });
   } catch (e: any) {
-    // Still return a session id so the UI can proceed; flag the failure.
-    try {
-      await auditLog({
-        route: "/api/session:POST",
-        status: 500, // record real failure
-        client_id: clientId,
-        user_id,
-        session_id: sessionId,
+    // Non-fatal fallback: return a synthetic session id so client UI can proceed
+    const fallback = crypto.randomUUID();
+    await safeAudit({
+      event: "session.create_fallback",
+      data: {
+        userId,
+        sessionId: fallback,
+        deviceHash,
+        ip,
+        ua,
+        error: String(e?.message || e),
         latency_ms: Date.now() - t0,
-        error: `db_create_failed: ${String(e?.message || e)}`,
-      });
-    } catch (logErr) {
-      console.warn("auditLog failed:", logErr);
-    }
-
-    const cookie = `ANON_SESSION_ID=${sessionId}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax; ${secureFlag}`;
-
-    return NextResponse.json(
-      { session_id: sessionId, warn: "db_create_failed" },
-      { headers: { "Cache-Control": "no-store", "Set-Cookie": cookie } }
-    );
+      },
+    });
+    return ok({ sessionId: fallback, isSecure, setAnonCookie: !userId, warn: "db_create_failed" });
   }
 }
 
-// Optional: reject other methods explicitly (helps with noisy crawlers)
-export async function GET() {
-  return NextResponse.json({ error: "method_not_allowed" }, { status: 405 });
+/* ---------------- helpers ---------------- */
+
+function ok(opts: { sessionId: string; isSecure: boolean; setAnonCookie: boolean; warn?: string }) {
+  const { sessionId, isSecure, setAnonCookie, warn } = opts;
+  const headers: Record<string, string> = { "Cache-Control": "no-store" };
+  if (setAnonCookie) {
+    headers["Set-Cookie"] = cookieStr(ANON_COOKIE, sessionId, COOKIE_MAX_AGE_SEC, isSecure);
+  }
+  const payload = warn ? { session_id: sessionId, warn } : { session_id: sessionId };
+  return NextResponse.json(payload, { headers });
+}
+
+function cookieStr(name: string, value: string, maxAge: number, isSecure: boolean) {
+  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax;${isSecure ? " Secure;" : ""}`;
+}
+
+function readCookie(header: string, key: string) {
+  const parts = header.split(/;\s*/);
+  for (const p of parts) {
+    const [k, v] = p.split("=");
+    if (k === key) return decodeURIComponent(v ?? "");
+  }
+  return null;
+}
+
+async function safeJson(req: NextRequest) {
+  try {
+    if (!req.body) return null;
+    return await req.json();
+  } catch {
+    return null;
+  }
+}
+
+async function safeGetIdentity(req: NextRequest) {
+  try {
+    return await getIdentity(req);
+  } catch {
+    return {} as any;
+  }
+}
+
+/**
+ * Accepts EITHER:
+ *   safeAudit("event", { ...data })
+ * OR
+ *   safeAudit({ event: "event", data: { ... } })
+ * and normalizes to auditLog({ event, data }).
+ */
+async function safeAudit(arg1: any, arg2?: any) {
+  try {
+    const payload =
+      typeof arg1 === "string" ? { event: arg1, data: arg2 } : arg1;
+    await auditLog(payload);
+  } catch {
+    // ignore audit failures
+  }
+}
+
+/* ---- idempotency reuse ---- */
+async function reuseByIdempotency(idempotencyKey: string): Promise<string | null> {
+  const rows = await db
+    .select({ sessionId: schema.chatSessions.sessionId })
+    .from(schema.chatSessions)
+    .where(eq(schema.chatSessions.idempotencyKey, idempotencyKey))
+    .limit(1);
+  return rows[0]?.sessionId ?? null;
+}
+
+/* ---- promotion + stray-merge ---- */
+async function promoteGuestSession({ userId, guestSessionId }: { userId: string; guestSessionId: string }) {
+  const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+
+  return await db.transaction(async (tx) => {
+    // 1) Promote the guest session if it exists and is unowned
+    const promoted = await tx
+      .update(schema.chatSessions)
+      .set({ userId, updatedAt: new Date() })
+      .where(and(eq(schema.chatSessions.sessionId, guestSessionId), isNull(schema.chatSessions.userId)))
+      .returning({ sessionId: schema.chatSessions.sessionId });
+
+    const promotedId = promoted[0]?.sessionId;
+
+    // If nothing promoted, try to reuse latest owned session
+    if (!promotedId) {
+      const latest = await tx
+        .select({ sessionId: schema.chatSessions.sessionId })
+        .from(schema.chatSessions)
+        .where(eq(schema.chatSessions.userId, userId))
+        .orderBy(desc(schema.chatSessions.updatedAt))
+        .limit(1);
+
+      return latest[0]?.sessionId ?? null;
+    }
+
+    // 2) Merge a stray session created within 15 minutes (best-effort)
+    const stray = await tx
+      .select({ sessionId: schema.chatSessions.sessionId })
+      .from(schema.chatSessions)
+      .where(
+        and(
+          eq(schema.chatSessions.userId, userId),
+          ne(schema.chatSessions.sessionId, guestSessionId),
+          gt(schema.chatSessions.createdAt, fifteenMinutesAgo)
+        )
+      )
+      .orderBy(desc(schema.chatSessions.createdAt))
+      .limit(1);
+
+    const strayId = stray[0]?.sessionId;
+    if (strayId) {
+      try {
+        // Move messages from stray to promoted
+        await tx
+          .update(schema.chatMessages)
+          .set({ sessionId: guestSessionId })
+          .where(eq(schema.chatMessages.sessionId, strayId));
+
+        // Delete stray session row
+        await tx
+          .delete(schema.chatSessions)
+          .where(eq(schema.chatSessions.sessionId, strayId));
+      } catch {
+        // best-effort only
+      }
+    }
+
+    // 3) Touch updatedAt for sidebar sorting
+    await tx
+      .update(schema.chatSessions)
+      .set({ updatedAt: new Date() })
+      .where(eq(schema.chatSessions.sessionId, guestSessionId));
+
+    return promotedId;
+  });
 }
