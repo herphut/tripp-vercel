@@ -209,58 +209,47 @@ export default function ChatPage() {
     };
   }, []);
 
-  // --------- BOOT: exchange + status + new session per visit ----------
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // 1) set HH_SESSION_ID + read identity
-        const x = await exchange();
-        if (cancelled) return;
-        setUserId(x.user_id ?? null);
+  // --------- BOOT: exchange + status ----------
+useEffect(() => {
+  let cancelled = false;
+  (async () => {
+    try {
+      // 1) set HH_SESSION_ID + read identity
+      const x = await exchange();
+      if (cancelled) return;
+      setUserId(x.user_id ?? null);
 
-        // 2) memory preference
-        const st = await fetchStatus();
-        if (cancelled) return;
-        setMemoryEnabled(!!st.memoryOptIn);
-        localStorage.setItem('tripp:memoryOptIn', String(!!st.memoryOptIn));
+      // 2) memory preference
+      const st = await fetchStatus();
+      if (cancelled) return;
+      setMemoryEnabled(!!st.memoryOptIn);
+      localStorage.setItem('tripp:memoryOptIn', String(!!st.memoryOptIn));
 
-        // 3) ALWAYS start the visit on a NEW chat session (unless user already picked one)
-        if (!userSelectedSessionRef.current) {
-          try {
-            const r = await fetch('/api/session', { method: 'POST', credentials: 'include' });
-            const j = await r.json().catch(() => null);
-            if (cancelled) return;
+      // 3) No more auto-creating a session here.
+      //    We'll create a session on first send (or when user picks one from sidebar).
 
-            if (j?.session_id) {
-              setSessionId(j.session_id);
-            } else {
-              // fallback: local-only session id so user can still chat
-              const localId =
-                (globalThis as any)?.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-              setSessionId(localId);
-            }
-          } finally {
-            // fresh slate either way
-            setMessages([{ role: 'assistant', content: "Hi! I'm Tripp. You're chatting with the new HerpHut AI. How can I help today?" }]);
-          }
-        }
-      } catch (e: any) {
-        // Suppress the transient 'needs_refresh' thrown by exchange() which triggers a redirect.
-        // Only show a UI auth error for other issues.
-        if (e?.message === 'needs_refresh') {
-          return;
-        }
-        setBootErr(e?.message || 'boot failed');
-      } finally {
-        setReady(true);
+      // Fresh greeting on boot
+      setMessages([
+        {
+          role: 'assistant',
+          content:
+            "Hi! I'm Tripp. You're chatting with the new HerpHut AI. How can I help today?",
+        },
+      ]);
+    } catch (e: any) {
+      if (e?.message === 'needs_refresh') {
+        return;
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  // --------------------------------------------
+      setBootErr(e?.message || 'boot failed');
+    } finally {
+      setReady(true);
+    }
+  })();
+  return () => {
+    cancelled = true;
+  };
+}, []);
+// --------------------------------------------
 
   // 🔁 Sliding session heartbeat (extends cookies periodically)
 useEffect(() => {
@@ -327,71 +316,117 @@ useEffect(() => {
   }
 
   async function onSubmit(e: FormEvent) {
-    e.preventDefault();
-    const text = input.trim();
-    if ((!text && !imageUrl) || sending) return; // require text or image
-    if (!sessionId) {
-      setMessages((m) => [...m, { role: 'assistant', content: 'No session yet—try again in a second.' }]);
-      return;
-    }
+  e.preventDefault();
+  const text = input.trim();
+  if ((!text && !imageUrl) || sending) return; // require text or image
 
-    setInput('');
-    const optimisticText =
-      imageUrl && text ? `${text}\n\n(Attached image: ${imageUrl})` :
-      imageUrl ? `(Attached image: ${imageUrl})` : text;
-
-    const optimistic: LocalChatMessage[] = [...messages, { role: 'user', content: optimisticText }];
-    setMessages(optimistic);
-    setSending(true);
-
+  // Lazily create a session on first send
+  let sid = sessionId;
+  if (!sid) {
     try {
-      const payload =
-        memoryEnabled
-          ? {
-              session_id: sessionId,
-              user_id: userId,
-              messages: [{ role: 'user', content: text || '(image attached)' }],
-              image_url: canUploadImages ? (imageUrl || undefined) : undefined,
-            }
-          : {
-              session_id: sessionId,
-              user_id: userId,
-              messages: buildRollingWindow(
-                messages.map((m) => ({ role: m.role, content: m.content })),
-                optimisticText
-              ),
-              image_url: canUploadImages ? (imageUrl || undefined) : undefined,
-            };
-
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
+      const r = await fetch("/api/session", {
+        method: "POST",
+        credentials: "include",
       });
-      if (!res.ok) throw new Error(await res.text());
+      const j = await r.json().catch(() => null);
 
-      const data = await res.json();
-      const serverMsgs =
-        Array.isArray(data?.messages)
-          ? data.messages.map((m: any) => ({
-              role: m.role as 'user' | 'assistant',
-              content: String(m.content ?? ''),
-            }))
-          : [{ role: 'assistant', content: String(data?.reply ?? data?.text ?? '') }];
-
-      setMessages(serverMsgs);
-      window.dispatchEvent(new Event('tripp:refreshRecents'));
-    } catch {
+      if (j?.session_id) {
+        sid = j.session_id;
+        setSessionId(sid);
+      } else {
+        // fallback: local-only session id so user can still chat
+        sid =
+          (globalThis as any)?.crypto?.randomUUID?.() ??
+          `${Date.now()}-${Math.random()}`;
+        setSessionId(sid);
+      }
+    } catch (err) {
+      console.error("Failed to create session on first send:", err);
       setMessages((m) => [
         ...m,
-        { role: 'assistant', content: 'Sorry—out basking for a sec. Try again in a bit. 🦎' },
+        {
+          role: "assistant",
+          content:
+            "I'm having trouble creating a session right now. Please try again in a moment.",
+        },
       ]);
-    } finally {
-      setSending(false);
-      setImageUrl(null);
+      return;
     }
   }
+
+  setInput("");
+  const optimisticText =
+    imageUrl && text
+      ? `${text}\n\n(Attached image: ${imageUrl})`
+      : imageUrl
+      ? `(Attached image: ${imageUrl})`
+      : text;
+
+  const optimistic: LocalChatMessage[] = [
+    ...messages,
+    { role: "user", content: optimisticText },
+  ];
+  setMessages(optimistic);
+  setSending(true);
+
+  try {
+    const payload =
+      memoryEnabled
+        ? {
+            session_id: sid,
+            user_id: userId,
+            messages: [{ role: "user", content: text || "(image attached)" }],
+            image_url: canUploadImages ? (imageUrl || undefined) : undefined,
+          }
+        : {
+            session_id: sid,
+            user_id: userId,
+            messages: buildRollingWindow(
+              messages.map((m) => ({ role: m.role, content: m.content })),
+              optimisticText
+            ),
+            image_url: canUploadImages ? (imageUrl || undefined) : undefined,
+          };
+
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(await res.text());
+
+    const data = await res.json();
+    const serverMsgs = Array.isArray(data?.messages)
+      ? data.messages.map((m: any) => ({
+          role: m.role as "user" | "assistant",
+          content: String(m.content ?? ""),
+        }))
+      : [
+          {
+            role: "assistant",
+            content: String(data?.reply ?? data?.text ?? ""),
+          },
+        ];
+
+    setMessages(serverMsgs);
+    window.dispatchEvent(new Event("tripp:refreshRecents"));
+  } catch (err) {
+    console.error(err);
+    setMessages((m) => [
+      ...m,
+      {
+        role: "assistant",
+        content:
+          "Sorry—out basking for a sec. Try again in a bit. 🦎",
+      },
+    ]);
+  } finally {
+    setSending(false);
+    setImageUrl(null);
+  }
+}
+
 
   // simple boot UX
   if (!ready) return <div style={{ padding: 24, color: '#fff' }}>Starting Tripp…</div>;
