@@ -3,10 +3,40 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 // Public routes that never require auth:
-const PUBLIC_PREFIXES = ["/", "/sso/callback", "/api/auth/wp", "/favicon.ico", "/robots.txt", "/sitemap.xml"];
+const PUBLIC_PREFIXES = [
+  "/",
+  "/sso/callback",
+  "/api/auth/wp",
+  "/favicon.ico",
+  "/robots.txt",
+  "/sitemap.xml",
+  "/offline", // make offline page itself public
+];
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
+
+  // 🔒 GLOBAL OFFLINE KILL-SWITCH
+  // If TRIPP_OFFLINE === "true", everyone gets rewritten to /offline
+  // except static assets and the /offline page itself.
+  if (process.env.TRIPP_OFFLINE === "true") {
+    const isStatic =
+      pathname.startsWith("/_next") || pathname.startsWith("/assets");
+
+    const isOfflinePage =
+      pathname === "/offline" || pathname.startsWith("/offline/");
+
+    if (!isStatic && !isOfflinePage) {
+      const url = req.nextUrl.clone();
+      url.pathname = "/offline";
+      return NextResponse.rewrite(url);
+    }
+
+    // Allow static assets and /offline to load normally
+    return NextResponse.next();
+  }
+
+  // ⬇️ Existing SSO logic stays the same ⬇️
 
   // Skip Next internal assets and allowed public paths
   if (
