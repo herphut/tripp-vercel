@@ -39,7 +39,7 @@ export default function Sidebar({
       }
 
       try {
-        const r = await fetch('/api/sessions/recent', {
+        const r = await fetch('/api/session/recent', {
           credentials: 'include',
           cache: 'no-store',
             headers: {
@@ -63,7 +63,7 @@ export default function Sidebar({
   useEffect(() => {
     async function doFetch() {
       try {
-        const r = await fetch('/api/sessions/recent', {
+        const r = await fetch('/api/session/recent', {
           credentials: 'include',
           cache: 'no-store',  headers: {
     'x-user-id': userId ? String(userId) : '',
