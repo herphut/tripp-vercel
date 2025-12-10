@@ -58,7 +58,7 @@ export default function Sidebar({
     };
   }, [authed, memoryEnabled]);
 
-  // listen for refresh events triggered elsewhere (new chat, send, etc.)
+  // listen for any refresh events triggered elsewhere (new chat, send, etc.)
   // but only refresh if authed + memoryEnabled
   useEffect(() => {
     async function doFetch() {

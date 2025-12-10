@@ -335,7 +335,7 @@ async function promoteGuestSession({
       }
     }
 
-    // 3) Touch updatedAt for sidebar sorting
+    // 3) Touch updatedAt sidebar sorting
     await tx
       .update(schema.chatSessions)
       .set({ updatedAt: new Date() })

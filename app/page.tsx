@@ -449,7 +449,7 @@ useEffect(() => {
   <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
     <Sidebar
       authed={!!userId}
-      userId={userId}   // ✅ ADD THIS LINE
+      userId={userId}
       memoryEnabled={memoryEnabled}
       onToggleMemoryAction={(next) => setMemoryEnabled(next)}
       onNewChatAction={async () => {
