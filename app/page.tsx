@@ -5,6 +5,8 @@ import type { FormEvent, ChangeEvent } from 'react';
 import { useEffect, useRef, useState } from 'react';
 import Sidebar from '../components/Sidebar';
 
+const userId = "brian";
+
 type LocalChatMessage = { role: 'user' | 'assistant'; content: string };
 
 // ---------- tiny auth boot helpers ----------
@@ -140,7 +142,7 @@ export default function ChatPage() {
   const [ready, setReady] = useState(false);
   const [bootErr, setBootErr] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [userId, setUserId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>("brian"); // TEMP DEV ID
   const [memoryEnabled, setMemoryEnabled] = useState(false);
 
   // did the user explicitly pick a prior session this visit?
@@ -217,7 +219,9 @@ useEffect(() => {
       // 1) set HH_SESSION_ID + read identity
       const x = await exchange();
       if (cancelled) return;
-      setUserId(x.user_id ?? null);
+      // In dev, if no HH user_id, fall back to local dev identity
+      setUserId(x.user_id ?? "brian");
+
 
       // 2) memory preference
       const st = await fetchStatus();
@@ -327,6 +331,9 @@ useEffect(() => {
       const r = await fetch("/api/session", {
         method: "POST",
         credentials: "include",
+        headers: {
+        "x-user-id": userId ? String(userId) : "",
+      },
       });
       const j = await r.json().catch(() => null);
 
@@ -375,6 +382,7 @@ useEffect(() => {
         ? {
             session_id: sid,
             user_id: userId,
+            userId,
             messages: [{ role: "user", content: text || "(image attached)" }],
             image_url: canUploadImages ? (imageUrl || undefined) : undefined,
           }
@@ -388,10 +396,15 @@ useEffect(() => {
             image_url: canUploadImages ? (imageUrl || undefined) : undefined,
           };
 
+          console.log("🚀 CHAT PAYLOAD userId:", userId);
+
+
     const res = await fetch("/api/chat", {
       method: "POST",
       credentials: "include",
-      headers: { "content-type": "application/json" },
+       headers: { "content-type": "application/json",
+    "x-user-id": userId ? String(userId) : "",
+  },
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(await res.text());
@@ -433,33 +446,47 @@ useEffect(() => {
   if (bootErr) return <div style={{ padding: 24, color: '#fff' }}>Auth error: {bootErr}</div>;
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
-      <Sidebar
-        authed={!!userId}
-        memoryEnabled={memoryEnabled}
-        onToggleMemoryAction={(next) => setMemoryEnabled(next)}
-        onNewChatAction={async () => {
-          // start a fresh session (logged-in users will get a DB row; guests just a new id)
-          const r = await fetch('/api/session', { method: 'POST', credentials: 'include' });
-          const j = await r.json().catch(() => null);
-          if (j?.session_id) {
-            setSessionId(j.session_id);
-            setMessages([{ role: 'assistant', content: "Fresh slate! What's on your mind?" }]);
-          } else {
-            handleNewChat();
-          }
+  <div style={{ display: 'flex', minHeight: '100vh', background: '#0f1113' }}>
+    <Sidebar
+      authed={!!userId}
+      userId={userId}   // ✅ ADD THIS LINE
+      memoryEnabled={memoryEnabled}
+      onToggleMemoryAction={(next) => setMemoryEnabled(next)}
+      onNewChatAction={async () => {
+        // start a fresh session (logged-in users will get a DB row; guests just a new id)
+        const r = await fetch('/api/session', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'x-user-id': userId ? String(userId) : '',
+          },
+        });
 
-          window.dispatchEvent(new Event('tripp:refreshRecents'));
+        const j = await r.json().catch(() => null);
+        if (j?.session_id) {
+          setSessionId(j.session_id);
+          setMessages([
+            { role: 'assistant', content: "Fresh slate! What's on your mind?" },
+          ]);
+        } else {
+          handleNewChat();
+        }
 
-        }}
-        headerExtra={<NewChatLink onClick={handleNewChat} visible={memoryEnabled} />}
-      />
+        window.dispatchEvent(new Event('tripp:refreshRecents'));
+      }}
+      headerExtra={
+        <NewChatLink onClick={handleNewChat} visible={memoryEnabled} />
+      }
+    />
 
+      
+      
+      
       <main style={{ flex: 1, padding: '24px 12px', boxSizing: 'border-box', color: '#fff' }}>
         <div style={{ display: 'flex', justifyContent: 'center' }}>
           <div style={{ width: '100%', maxWidth: 900 }}>
             <small style={{ opacity: 0.7 }}>
-              session: {sessionId?.slice(0, 8)}… • user: {userId ?? 'anon'} • memory: {memoryEnabled ? 'ON' : 'OFF'}
+              session: {sessionId?.slice(0, 8)}… • user: {userId} • memory: {memoryEnabled ? 'ON' : 'OFF'}
             </small>
 
             <h2 style={{ textAlign: 'center', margin: '12px 0 16px' }}>Chat with Tripp</h2>

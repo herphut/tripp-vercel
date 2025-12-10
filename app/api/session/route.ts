@@ -8,7 +8,6 @@ import crypto from "crypto";
 import { db, schema } from "@/app/api/_lib/db/db";
 import { eq, and, ne, desc, gt, isNull } from "drizzle-orm";
 
-// Optional utilities in your project
 import { auditLog } from "@/app/api/_lib/audit";
 import { getIdentity } from "@/app/api/_lib/identity";
 
@@ -24,8 +23,23 @@ export async function POST(req: NextRequest) {
   const cookieHeader = req.headers.get("cookie") ?? "";
   const anonCookie = readCookie(cookieHeader, ANON_COOKIE);
 
-  // Identity (safe)
-  const { userId, deviceHash, ip, ua } = await safeGetIdentity(req);
+  // Identity (safe, no downgrade)
+  const ident = await safeGetIdentity(req);
+  const userId = ident.mode === "user" ? ident.user_id : null;
+
+  // Basic device fingerprint for audit only
+  const ip =
+    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    req.headers.get("x-real-ip") ??
+    null;
+
+  const ua = req.headers.get("user-agent") ?? null;
+
+  const deviceHash =
+    ip && ua
+      ? crypto.createHash("sha256").update(ip + "|" + ua).digest("hex")
+          .slice(0, 32)
+      : null;
 
   // Parse body for idempotency
   const body = await safeJson(req);
@@ -33,7 +47,7 @@ export async function POST(req: NextRequest) {
 
   try {
     // 1) If logged-in user + anon cookie present → PROMOTE guest to user
-    if (userId && anonCookie) {
+    if (ident.mode === "user" && anonCookie) {
       const promoted = await promoteGuestSession({
         userId,
         guestSessionId: anonCookie,
@@ -44,9 +58,13 @@ export async function POST(req: NextRequest) {
           event: "session.promote",
           data: { userId, sessionId: promoted, deviceHash, ip, ua },
         });
-        return ok({ sessionId: promoted, isSecure, setAnonCookie: false });
+        return ok({
+          sessionId: promoted,
+          isSecure,
+          setAnonCookie: false, // never set anon cookie for real users
+        });
       }
-      // If promotion couldn't happen (cookie stale/missing), we fall through to create/reuse
+      // If promotion couldn't happen (cookie stale/missing), fall through to create/reuse
     }
 
     // 2) If idempotencyKey provided, try to reuse
@@ -55,16 +73,27 @@ export async function POST(req: NextRequest) {
       if (reused) {
         await safeAudit({
           event: "session.reuse",
-          data: { userId, sessionId: reused, idempotencyKey, deviceHash, ip, ua },
+          data: {
+            userId,
+            sessionId: reused,
+            idempotencyKey,
+            deviceHash,
+            ip,
+            ua,
+          },
         });
-        return ok({ sessionId: reused, isSecure, setAnonCookie: !userId });
+        return ok({
+          sessionId: reused,
+          isSecure,
+          // only anon users get anon cookies
+          setAnonCookie: ident.mode === "anon",
+        });
       }
     }
 
     // 3) Create a new session (anon or user) idempotently
     const newSessionId: string = crypto.randomUUID();
 
-    // Drizzle upsert-by-idempotency: try insert; if unique violation, select the existing
     let createdSessionId: string = newSessionId;
     try {
       const inserted = await db
@@ -82,8 +111,11 @@ export async function POST(req: NextRequest) {
       createdSessionId = inserted[0].sessionId;
     } catch (e: any) {
       // If collide on idempotency unique index, re-select
-      if (String(e?.message || "").toLowerCase().includes("duplicate key")) {
-        const reused = await reuseByIdempotency(idempotencyKey!);
+      if (
+        idempotencyKey &&
+        String(e?.message || "").toLowerCase().includes("duplicate key")
+      ) {
+        const reused = await reuseByIdempotency(idempotencyKey);
         if (reused) createdSessionId = reused;
         else throw e;
       } else {
@@ -104,7 +136,12 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    return ok({ sessionId: createdSessionId, isSecure, setAnonCookie: !userId });
+    return ok({
+      sessionId: createdSessionId,
+      isSecure,
+      // only true anon gets anon cookie
+      setAnonCookie: ident.mode === "anon",
+    });
   } catch (e: any) {
     // Non-fatal fallback: return a synthetic session id so client UI can proceed
     const fallback = crypto.randomUUID();
@@ -120,24 +157,50 @@ export async function POST(req: NextRequest) {
         latency_ms: Date.now() - t0,
       },
     });
-    return ok({ sessionId: fallback, isSecure, setAnonCookie: !userId, warn: "db_create_failed" });
+    return ok({
+      sessionId: fallback,
+      isSecure,
+      setAnonCookie: ident.mode === "anon",
+      warn: "db_create_failed",
+    });
   }
 }
 
 /* ---------------- helpers ---------------- */
 
-function ok(opts: { sessionId: string; isSecure: boolean; setAnonCookie: boolean; warn?: string }) {
+function ok(opts: {
+  sessionId: string;
+  isSecure: boolean;
+  setAnonCookie: boolean;
+  warn?: string;
+}) {
   const { sessionId, isSecure, setAnonCookie, warn } = opts;
   const headers: Record<string, string> = { "Cache-Control": "no-store" };
   if (setAnonCookie) {
-    headers["Set-Cookie"] = cookieStr(ANON_COOKIE, sessionId, COOKIE_MAX_AGE_SEC, isSecure);
+    headers["Set-Cookie"] = cookieStr(
+      ANON_COOKIE,
+      sessionId,
+      COOKIE_MAX_AGE_SEC,
+      isSecure,
+    );
   }
-  const payload = warn ? { session_id: sessionId, warn } : { session_id: sessionId };
+  const payload = warn
+    ? { session_id: sessionId, warn }
+    : { session_id: sessionId };
   return NextResponse.json(payload, { headers });
 }
 
-function cookieStr(name: string, value: string, maxAge: number, isSecure: boolean) {
-  return `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax;${isSecure ? " Secure;" : ""}`;
+function cookieStr(
+  name: string,
+  value: string,
+  maxAge: number,
+  isSecure: boolean,
+) {
+  return `${name}=${encodeURIComponent(
+    value,
+  )}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax;${
+    isSecure ? " Secure;" : ""
+  }`;
 }
 
 function readCookie(header: string, key: string) {
@@ -162,7 +225,13 @@ async function safeGetIdentity(req: NextRequest) {
   try {
     return await getIdentity(req);
   } catch {
-    return {} as any;
+    return {
+      user_id: null,
+      client_id: "webchat",
+      session_id: null,
+      anon: false,
+      mode: "unknown" as const,
+    };
   }
 }
 
@@ -184,7 +253,9 @@ async function safeAudit(arg1: any, arg2?: any) {
 }
 
 /* ---- idempotency reuse ---- */
-async function reuseByIdempotency(idempotencyKey: string): Promise<string | null> {
+async function reuseByIdempotency(
+  idempotencyKey: string,
+): Promise<string | null> {
   const rows = await db
     .select({ sessionId: schema.chatSessions.sessionId })
     .from(schema.chatSessions)
@@ -194,7 +265,15 @@ async function reuseByIdempotency(idempotencyKey: string): Promise<string | null
 }
 
 /* ---- promotion + stray-merge ---- */
-async function promoteGuestSession({ userId, guestSessionId }: { userId: string; guestSessionId: string }) {
+async function promoteGuestSession({
+  userId,
+  guestSessionId,
+}: {
+  userId: string | null;
+  guestSessionId: string;
+}) {
+  if (!userId) return null;
+
   const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
 
   return await db.transaction(async (tx) => {
@@ -202,7 +281,12 @@ async function promoteGuestSession({ userId, guestSessionId }: { userId: string;
     const promoted = await tx
       .update(schema.chatSessions)
       .set({ userId, updatedAt: new Date() })
-      .where(and(eq(schema.chatSessions.sessionId, guestSessionId), isNull(schema.chatSessions.userId)))
+      .where(
+        and(
+          eq(schema.chatSessions.sessionId, guestSessionId),
+          isNull(schema.chatSessions.userId),
+        ),
+      )
       .returning({ sessionId: schema.chatSessions.sessionId });
 
     const promotedId = promoted[0]?.sessionId;
@@ -227,8 +311,8 @@ async function promoteGuestSession({ userId, guestSessionId }: { userId: string;
         and(
           eq(schema.chatSessions.userId, userId),
           ne(schema.chatSessions.sessionId, guestSessionId),
-          gt(schema.chatSessions.createdAt, fifteenMinutesAgo)
-        )
+          gt(schema.chatSessions.createdAt, fifteenMinutesAgo),
+        ),
       )
       .orderBy(desc(schema.chatSessions.createdAt))
       .limit(1);

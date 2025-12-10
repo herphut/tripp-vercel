@@ -73,8 +73,11 @@ export async function GET(req: NextRequest) {
     }));
 
     return NextResponse.json({ items }, noStore);
-  } catch {
+  } catch (err) {
+  console.error("RECENT SESSIONS API ERROR:", err);
+
     return NextResponse.json({ items: [] }, { status: 200, headers: { "Cache-Control": "no-store" } });
   }
 }
+
 

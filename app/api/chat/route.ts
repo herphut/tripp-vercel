@@ -1,9 +1,9 @@
+// app/api/chat/route.ts
 export const runtime = "nodejs";
 import "server-only";
 
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
-import OpenAI from "openai";
 import { asc, eq, sql } from "drizzle-orm";
 
 import { db, schema } from "@/app/api/_lib/db/db";
@@ -11,6 +11,10 @@ import { TRIPP_PROMPT } from "@/app/api/_lib/trippPrompt";
 import { getIdentity } from "@/app/api/_lib/identity";
 import { auditLog } from "../_lib/audit";
 import { readPrefs } from "@/app/api/_lib/prefs";
+
+if (process.env.NODE_ENV !== "production") {
+  process.env.OPENAI_API_KEY = "dummy-local-key";
+}
 
 const systemPrompt = TRIPP_PROMPT;
 
@@ -25,6 +29,7 @@ type IncomingMessage = {
 
 type Body = {
   session_id?: string | null;
+  userId?: string | null;
   user_id?: string | null;
   messages?: IncomingMessage[];
   image_url?: string | null;
@@ -62,43 +67,27 @@ function makeTitleFrom(text: string): string {
   return trimmed.slice(0, 77) + "...";
 }
 
-// ---------- OpenAI client ----------
+// ---------- MML-Core config ----------
 
-const openai = haveKey("OPENAI_API_KEY")
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
+const MML_CORE_URL =
+  process.env.MML_CORE_URL || "http://localhost:3005/chat";
 
 // ---------- Route ----------
 
 export async function POST(req: NextRequest) {
   const t0 = Date.now();
 
-  // Identity from JWT / headers via your helper
-  const { client_id, user_id: identityUserId } = await getIdentity(req);
-  const clientId = client_id ?? "webchat";
-  const userId = identityUserId || null;
-  const isAnon = !userId;
-
-  if (!openai) {
-    await auditLog({
-      route: "/api/chat:POST",
-      status: 500,
-      client_id: clientId,
-      user_id: userId,
-      session_id: null,
-      latency_ms: Date.now() - t0,
-      error: "missing_openai_key",
-    });
-    return NextResponse.json(
-      { error: "server_not_configured" },
-      { status: 500, headers: { "Cache-Control": "no-store" } }
-    );
-  }
+  // ✅ Identity from canonical helper (no downgrade)
+  const ident = await getIdentity(req);
+  const clientId = ident.client_id ?? "webchat";
+  const userId = ident.mode === "user" ? ident.user_id : null;
+  const isAnon = ident.mode !== "user";
 
   // Parse body
   let body: Body;
   try {
     body = (await req.json()) as Body;
+    console.log("📥 API CHAT BODY:", body);
   } catch {
     await auditLog({
       route: "/api/chat:POST",
@@ -111,7 +100,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(
       { error: "bad_request" },
-      { status: 400, headers: { "Cache-Control": "no-store" } }
+      { status: 400, headers: { "Cache-Control": "no-store" } },
     );
   }
 
@@ -128,7 +117,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(
       { error: "missing_session_id" },
-      { status: 400, headers: { "Cache-Control": "no-store" } }
+      { status: 400, headers: { "Cache-Control": "no-store" } },
     );
   }
 
@@ -145,7 +134,7 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(
       { error: "messages_required" },
-      { status: 400, headers: { "Cache-Control": "no-store" } }
+      { status: 400, headers: { "Cache-Control": "no-store" } },
     );
   }
 
@@ -162,13 +151,12 @@ export async function POST(req: NextRequest) {
     });
     return NextResponse.json(
       { error: "messages_required" },
-      { status: 400, headers: { "Cache-Control": "no-store" } }
+      { status: 400, headers: { "Cache-Control": "no-store" } },
     );
   }
 
-  // Read memory preference – used later for embeddings/long-term memory,
-  // but NOT for basic short-term logging.
-  let memoryOptIn = false;
+  // Memory preference (for embeddings / long-term later)
+  let memoryOptIn = true;
   if (userId) {
     try {
       memoryOptIn = await readPrefs(userId);
@@ -177,10 +165,10 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // For our new design:
+  // For now:
   // - anon: persist
-  // - logged-in, memory OFF: persist (30-day short-term log)
-  // - logged-in, memory ON: persist AND later eligible for embeddings
+  // - logged-in, memory OFF: persist (30 day short-term)
+  // - logged-in, memory ON: persist + eligible for future embeddings
   const shouldPersist = true;
 
   const ip = getClientIp(req);
@@ -253,7 +241,7 @@ export async function POST(req: NextRequest) {
           .set({
             firstUserAt: sql`COALESCE(${schema.chatSessions.firstUserAt}, NOW())`,
             title: sql`COALESCE(${schema.chatSessions.title}, ${makeTitleFrom(
-              lastUser.content
+              lastUser.content,
             )})`,
           })
           .where(eq(schema.chatSessions.sessionId, sessionId));
@@ -287,18 +275,82 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // ---------- Call MML-Core instead of OpenAI ----------
+
+  // Derive final user id that we send to MML-Core (can differ from DB userId in dev)
+  const bodyUserId =
+    (body as any).userId ?? (body as any).user_id ?? null;
+
+  const cleanUserId =
+    bodyUserId ??
+    userId ??
+    (process.env.NODE_ENV !== "production" ? "brian" : "anonymous");
+
+  const cleanIsAnon =
+    !userId && (cleanUserId === "anonymous" || !bodyUserId);
+
+  console.log(
+    "🧩 CHAT ROUTE → cleanUserId:",
+    cleanUserId,
+    "cleanIsAnon:",
+    cleanIsAnon,
+    "identityUserId:",
+    userId,
+  );
+
   try {
-    const completion = await openai.chat.completions.create({
-      model: process.env.TRIPP_MODEL || "gpt-4.1-mini",
-      messages: conversation.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      temperature: 0.7,
+    const coreRes = await fetch(MML_CORE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: lastUser.content,
+        history: conversation,
+        userId: cleanUserId,
+        metadata: {
+          persona: "tripp",
+          clientId,
+          userId: cleanUserId,
+          sessionId,
+          memoryOptIn,
+          ipHash,
+          isAnon: cleanIsAnon,
+        },
+      }),
     });
 
+    if (!coreRes.ok) {
+      const text = await coreRes.text();
+      console.error("Error from MML-Core:", text);
+
+      await auditLog({
+        route: "/api/chat:POST",
+        status: 500,
+        client_id: clientId,
+        user_id: userId,
+        session_id: sessionId,
+        latency_ms: Date.now() - t0,
+        error: "mml_core_error",
+      });
+
+      return NextResponse.json(
+        { error: "mml_core_error" },
+        {
+          status: 500,
+          headers: {
+            "content-type": "application/json",
+            "Cache-Control": "no-store",
+          },
+        },
+      );
+    }
+
+    const coreData = (await coreRes.json()) as {
+      message?: string;
+      raw?: any;
+    };
+
     const assistantText =
-      completion.choices?.[0]?.message?.content?.trim() ||
+      coreData.message?.trim() ||
       "Sorry, I couldn’t think of a reply.";
 
     if (shouldPersist) {
@@ -317,8 +369,14 @@ export async function POST(req: NextRequest) {
 
     const clientMessages =
       persistedHistory && shouldPersist
-        ? [...persistedHistory, { role: "assistant" as Role, content: assistantText }]
-        : [...messages, { role: "assistant" as Role, content: assistantText }];
+        ? [
+            ...persistedHistory,
+            { role: "assistant" as Role, content: assistantText },
+          ]
+        : [
+            ...messages,
+            { role: "assistant" as Role, content: assistantText },
+          ];
 
     await auditLog({
       route: "/api/chat:POST",
@@ -338,7 +396,7 @@ export async function POST(req: NextRequest) {
           "content-type": "application/json",
           "Cache-Control": "no-store",
         },
-      }
+      },
     );
   } catch (e: any) {
     const errMsg = String(e?.message || e);
@@ -362,7 +420,7 @@ export async function POST(req: NextRequest) {
           "content-type": "application/json",
           "Cache-Control": "no-store",
         },
-      }
+      },
     );
   }
 }
